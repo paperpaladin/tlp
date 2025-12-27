@@ -400,6 +400,99 @@ def cmd_norec(args):
     return run_oracle(args, norec_check, "NoREC")
 
 
+# ------------------------------------------------- aggregate partitioning
+#
+# Row-level TLP asks whether the partitions hold the same ROWS. This asks
+# whether an aggregate computed over the whole table equals the same
+# aggregate recombined from the three partitions -- which is a different
+# question, and catches bugs the row form cannot see, because an aggregate
+# can be wrong while every row is present.
+#
+# The interesting part is that there is no single recombination rule. Each
+# aggregate composes differently, and getting one wrong produces a tool
+# that reports bugs in a correct database:
+#
+#   SUM      add the partition sums.    SUM of nothing is NULL, not 0, and
+#                                       the outer SUM skips NULLs, so an
+#                                       empty partition contributes nothing
+#                                       and the arithmetic still works.
+#   COUNT    ADD the partition counts, not count them. COUNT of nothing is
+#            0, so this one needs no care, which is exactly why writing it
+#            by analogy with SUM is a mistake waiting to happen.
+#   MIN      take the MIN of the partition MINs. MIN ignores NULLs at both
+#            levels, which is what makes the two levels agree.
+#   MAX      the mirror of MIN.
+#   AVG      NOT decomposable this way. The average of three averages is
+#            not the average, and weighting them needs the counts -- so it
+#            is left out rather than approximated.
+
+AGGREGATES = {
+    "SUM": "SUM",     # outer combiner for the partition results
+    "COUNT": "SUM",   # counts ADD, they do not count
+    "MIN": "MIN",
+    "MAX": "MAX",
+}
+
+
+def agg_check(db, pred, agg, col):
+    """An aggregate over the whole table against the same one recombined."""
+    outer = AGGREGATES[agg]
+    (whole,) = db.execute("SELECT %s(%s) FROM t" % (agg, col)).fetchone()
+    (parts,) = db.execute(
+        "SELECT %s(a) FROM ("
+        "  SELECT %s(%s) AS a FROM t WHERE (%s)"
+        "  UNION ALL SELECT %s(%s) FROM t WHERE NOT (%s)"
+        "  UNION ALL SELECT %s(%s) FROM t WHERE (%s) IS NULL)"
+        % (outer, agg, col, pred, agg, col, pred, agg, col, pred)
+    ).fetchone()
+    if whole == parts:
+        return None
+    return ("agg-%s" % agg, whole, parts)
+
+
+def cmd_agg(args):
+    import random
+    rnd = random.Random(args.seed)
+    db = sqlite3.connect(":memory:")
+    found = tested = skipped = 0
+    per_agg = {a: 0 for a in AGGREGATES}
+
+    for i in range(args.n):
+        ddl, cols, rows = build(db, rnd, args.rows, args.null_rate)
+        pred = gen_predicate(rnd, cols, args.depth)
+        # SUM and COUNT over TEXT coerce in ways that are SQLite's business
+        # rather than the standard's, so the column is chosen to suit the
+        # aggregate instead of pretending that question does not exist.
+        ints = [c for c, ty in cols if ty == "INTEGER"]
+        for agg in AGGREGATES:
+            if agg in ("SUM",) and not ints:
+                continue
+            col = rnd.choice(ints) if agg == "SUM" else rnd.choice(cols)[0]
+            try:
+                bad = agg_check(db, pred, agg, col)
+            except sqlite3.Error:
+                skipped += 1
+                continue
+            tested += 1
+            per_agg[agg] += 1
+            if bad:
+                found += 1
+                print("FOUND  %s disagreement at step %d" % (bad[0], i))
+                print("  %s" % ddl)
+                for r in rows:
+                    print("  INSERT INTO t VALUES %r;" % (r,))
+                print("  predicate: %s" % pred)
+                print("  whole %r, recombined %r" % (bad[1], bad[2]))
+                if found >= args.max_reports:
+                    return 1
+
+    print("aggregate TLP: %d checks, %d disagreements, %d skipped" %
+          (tested, found, skipped))
+    print("  per aggregate: %s" %
+          ", ".join("%s %d" % (a, n) for a, n in sorted(per_agg.items())))
+    return 1 if found else 0
+
+
 # ------------------------------------------------------------- selftest
 #
 # Both oracles report nothing against SQLite, and will keep reporting
@@ -466,35 +559,58 @@ class Corrupt:
         # TLP never asks for a count.
         if k == "count-off-by-one" and sql.startswith("SELECT COUNT(*)") and rows:
             return [(rows[0][0] + 1,)]
+        # An aggregate over the whole table that is wrong while every row is
+        # present and correct. Neither row-level TLP nor NoREC can see this:
+        # the rows reassemble perfectly and the counts agree. Only the
+        # aggregate form asks the question it answers wrongly.
+        #
+        # "FROM (" excludes NoREC's own unoptimised query, which is also a
+        # SELECT SUM(...) and was being corrupted by the first version of
+        # this condition -- so the bug appeared to be caught by NoREC 100%
+        # of the time, when what NoREC had actually noticed was this
+        # wrapper breaking NoREC.
+        if k == "aggregate-skew" and sql.startswith("SELECT SUM(") \
+                and "FROM (" not in sql and "UNION" not in sql \
+                and rows and rows[0][0] is not None:
+            return [(rows[0][0] + 1,)]
         return rows
 
 
-BUG_KINDS = ["drop-row", "duplicate-row", "null-only", "count-off-by-one"]
+BUG_KINDS = ["drop-row", "duplicate-row", "null-only", "count-off-by-one",
+             "aggregate-skew"]
 
 
 def cmd_selftest(args):
     import random
     real = sqlite3.connect(":memory:")
 
-    print("%-20s %8s %8s" % ("planted bug", "TLP", "NoREC"))
+    print("%-20s %8s %8s %8s" % ("planted bug", "TLP", "NoREC", "agg"))
     worst = {}
     for kind in BUG_KINDS:
-        hits = {"TLP": 0, "NoREC": 0}
+        hits = {"TLP": 0, "NoREC": 0, "agg": 0}
         rnd = random.Random(args.seed)
         for _ in range(args.n):
             _, cols, _ = build(real, rnd, args.rows, args.null_rate)
             real.execute("CREATE INDEX IF NOT EXISTS i0 ON t(%s)" % cols[0][0])
             pred = gen_predicate(rnd, cols, args.depth)
             bent = Corrupt(real, kind)
+            ints = [c for c, ty in cols if ty == "INTEGER"]
             for name, fn in (("TLP", tlp_check), ("NoREC", norec_check)):
                 try:
                     if fn(bent, pred):
                         hits[name] += 1
                 except sqlite3.Error:
                     pass
-        print("%-20s %7d%% %7d%%" % (kind,
-                                     100 * hits["TLP"] // args.n,
-                                     100 * hits["NoREC"] // args.n))
+            if ints:
+                try:
+                    if agg_check(bent, pred, "SUM", ints[0]):
+                        hits["agg"] += 1
+                except sqlite3.Error:
+                    pass
+        print("%-20s %7d%% %7d%% %7d%%" % (kind,
+                                           100 * hits["TLP"] // args.n,
+                                           100 * hits["NoREC"] // args.n,
+                                           100 * hits["agg"] // args.n))
         worst[kind] = max(hits.values())
 
     missed = [k for k, v in worst.items() if v == 0]
@@ -548,6 +664,15 @@ def main():
         q.add_argument("--no-index", action="store_false", dest="index")
         q.add_argument("--max-reports", type=int, default=3, dest="max_reports")
         q.set_defaults(fn=fn)
+
+    p = sub.add_parser("agg", help="aggregate partitioning")
+    p.add_argument("--n", type=int, default=400)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--rows", type=int, default=8)
+    p.add_argument("--depth", type=int, default=2)
+    p.add_argument("--null-rate", type=float, default=0.25, dest="null_rate")
+    p.add_argument("--max-reports", type=int, default=3, dest="max_reports")
+    p.set_defaults(fn=cmd_agg)
 
     p = sub.add_parser("selftest", help="plant bugs and check the oracles notice")
     p.add_argument("--n", type=int, default=200)

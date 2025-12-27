@@ -9,11 +9,12 @@ $ python3 tlp.py tlp --n 500
 TLP: 500 queries, 0 disagreements, 0 skipped, 152 genuinely three-valued (30%)
 
 $ python3 tlp.py selftest
-planted bug               TLP    NoREC
-drop-row                 100%       0%
-duplicate-row            100%       0%
-null-only                 23%       0%
-count-off-by-one           0%     100%
+planted bug               TLP    NoREC      agg
+drop-row                 100%       0%       0%
+duplicate-row            100%       0%       0%
+null-only                 23%       0%       0%
+count-off-by-one           0%     100%       0%
+aggregate-skew             0%       0%      85%
 
 every planted bug is caught by at least one oracle
 ```
@@ -63,13 +64,46 @@ amount of reading the query will show you.
 Between them these two techniques found over 400 real bugs in SQLite,
 MySQL, PostgreSQL and TiDB.
 
-## Neither oracle subsumes the other
+**Aggregate TLP** is the third, and the one where the technique stops
+being a one-liner. An aggregate over the whole table must equal the same
+aggregate recombined from the three partitions -- but there is no single
+recombination rule:
 
-That is a design claim, so it is measured rather than asserted. From the
-table above: TLP catches every row-level bug and **none** of the count bug;
-NoREC catches the count bug and **none** of the row-level ones. TLP never
-asks for a count, so it cannot see a count that is wrong; NoREC only ever
-compares two numbers, so it cannot see which rows moved.
+| aggregate | recombine with | why |
+|---|---|---|
+| `SUM` | `SUM` | sums add; `SUM` of nothing is NULL and the outer `SUM` skips it |
+| `COUNT` | **`SUM`** | counts **add**, they do not count |
+| `MIN` | `MIN` | `MIN` ignores NULLs at both levels, which is what makes them agree |
+| `MAX` | `MAX` | the mirror of `MIN` |
+| `AVG` | *(none)* | the average of three averages is not the average |
+
+## No oracle subsumes another
+
+That is a design claim, so it is measured rather than asserted, and the
+table above is the measurement. Each oracle catches exactly the class it
+was built for and **nothing else**:
+
+- TLP never asks for a count, so it cannot see a count that is wrong.
+- NoREC only ever compares two numbers, so it cannot see which rows moved.
+- Both compare rows or counts, so neither can see an aggregate that is
+  wrong while every row is present and every count agrees.
+
+### The composition rules are load-bearing
+
+The table of rules above looks arbitrary until you use the wrong one.
+Against a database that is behaving perfectly:
+
+| aggregate | correct rule | wrong rule | wrong rule |
+|---|---|---|---|
+| `SUM` | 0 / 210 | `MIN` 150 | `COUNT` 208 |
+| `COUNT` | 0 / 210 | `COUNT` 208 | `MIN` 210 |
+| `MIN` | 0 / 210 | `SUM` 135 | `MAX` 127 |
+| `MAX` | 0 / 210 | `SUM` 135 | `MIN` 125 |
+
+Every correct rule raises **no** false alarms; every wrong one raises
+hundreds. `COUNT` is the one to stare at: its combiner is `SUM`, and
+writing `COUNT` there by analogy with the others -- the obvious mistake --
+produces a tool that reports a bug in 208 of 210 correct queries.
 
 ## The generator decides whether any of this means anything
 
@@ -129,11 +163,10 @@ order is never compared, only sorted multisets, because SQL does not
 promise an order without `ORDER BY` and comparing sequences would report a
 bug every time the planner legitimately changed its mind.
 
-Only `WHERE` is partitioned so far. The published work found the most bugs
-partitioning a **JOIN's `ON` clause** and in the aggregate variants
-(`SUM`, `COUNT`, `MIN`, `MAX` over the three partitions, each with its own
-composition rule). Those are the next items in `PLAN.md` and they are where
-this gets genuinely interesting.
+Only `WHERE` is partitioned. The published work found the most bugs
+partitioning a **JOIN's `ON` clause**, which is the next item in
+`PLAN.md`. `DISTINCT` and `GROUP BY` partitioning are not implemented
+either.
 
 ## The one hand-written thing, and why
 
@@ -161,7 +194,7 @@ equivalent mutant rather than a hole.
 
 ```
 $ make test
-21 passed, 0 failed
+36 passed, 0 failed
 ```
 
 No pytest, no network, no dependencies. `sqlite3` is in the standard

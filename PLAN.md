@@ -11,6 +11,8 @@ tlp.py truth   [--depth N]           three-valued logic, exhaustively
 tlp.py vacuity [--n N]               how often the generator is interesting
 tlp.py tlp     [--n N] [--seed S]    ternary partitioning
 tlp.py norec   [--n N] [--seed S]    optimised against unoptimised
+tlp.py agg     [--n N] [--seed S]    aggregate partitioning
+tlp.py selftest                      plant bugs, check the oracles notice
 tlp.py reduce  FILE                  shrink a found case to a minimal one
 ```
 
@@ -152,9 +154,29 @@ foreign keys, no virtual tables, no window functions.
 
 - [ ] 07 partition on a JOIN's ON clause rather than a WHERE, which is
       where the published work found the most bugs
-- [ ] 08 aggregate TLP: SUM, COUNT, MIN and MAX over the three partitions
+- [x] 08 aggregate TLP: SUM, COUNT, MIN and MAX over the three partitions
       must reassemble, which needs a different composition rule per
       aggregate and is where this gets interesting
+      done: SUM recombines with SUM, MIN with MIN, MAX with MAX -- and
+            COUNT with SUM, because counts add rather than counting. AVG
+            is left out rather than approximated: the average of three
+            averages is not the average, and weighting them needs the
+            counts, which is a different query.
+      proves: the rules are load-bearing, which matters because they look
+            arbitrary. Against a correct database each right rule raises
+            0 alarms in 210 checks and each wrong one raises 125 to 210.
+            COUNT is the one to stare at: writing COUNT as its own
+            combiner, which is the obvious mistake, reports a bug in 208
+            of 210 correct queries.
+            And it catches what the other two cannot: an aggregate wrong
+            while every row is present and every count agrees is caught
+            85% of the time by this oracle and 0% by either other.
+      found: the planted bug for it was hitting the wrong query. It fired
+            on anything starting "SELECT SUM(", which includes NoREC's own
+            unoptimised form, so the table showed NoREC catching it 100%
+            of the time -- what NoREC had actually noticed was the test
+            wrapper breaking NoREC. Excluding subqueries gives the honest
+            row: 0%, 0%, 85%.
 - [ ] 09 DISTINCT and GROUP BY partitioning
 
 ## Open questions
