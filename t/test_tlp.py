@@ -326,5 +326,114 @@ pct = 100 * caught // tried if tried else 0
 ok("the aggregate oracle catches it %d%% of the time" % pct) if pct > 50 else \
     no("the aggregate oracle catches it only %d%% of the time" % pct)
 
+# --- join partitioning -----------------------------------------------------
+#
+# Two relations, and the first test for each is a hand-worked example
+# rather than a random one. A relation that only ever meets generated data
+# is a relation nobody has checked: if it were wrong, the generator would
+# dutifully produce thousands of cases agreeing with it.
+
+hand = sqlite3.connect(":memory:")
+hand.executescript("""
+CREATE TABLE t1 (a0 INTEGER, a1 TEXT);
+CREATE TABLE t2 (b0 INTEGER, b1 TEXT);
+INSERT INTO t1 VALUES (1,'x'),(2,NULL),(NULL,'y'),(3,'x');
+INSERT INTO t2 VALUES (1,'x'),(2,'z'),(NULL,NULL);
+""")
+HAND_PRED = "t1.a0 = t2.b0 OR t1.a1 = t2.b1"
+
+check("the inner relation holds on a worked example",
+      tlp.join_check(hand, HAND_PRED), None)
+check("the left-join relation holds on a worked example",
+      tlp.leftjoin_check(hand, HAND_PRED), None)
+
+# The arithmetic is small enough to do by hand, which is the point of
+# having one case that is not generated. Three pairs are TRUE:
+#
+#   (1,'x') x (1,'x')     a0 = b0
+#   (2,NULL) x (2,'z')    a0 = b0
+#   (3,'x') x (1,'x')     a1 = b1
+#
+# Everything else is FALSE or NULL. (NULL,'y') matches nothing TRUE, so it
+# is the one row the left join pads: 3 + 1 = 4.
+#
+# The first version of this said the join keeps 2, which is simply wrong --
+# an expectation written from my head rather than worked out, and the kind
+# of mistake that is the whole reason this project takes its numbers from
+# an authority. SQLite said 3 and SQLite was right.
+n = lambda q: hand.execute(q).fetchone()[0]
+check("that example really is a 4x3 cross product", n("SELECT COUNT(*) FROM t1, t2"), 12)
+check("...of which the join keeps 3",
+      n("SELECT COUNT(*) FROM t1 JOIN t2 ON (%s)" % HAND_PRED), 3)
+check("...and the left join yields 4, the 3 plus one padded row",
+      n("SELECT COUNT(*) FROM t1 LEFT JOIN t2 ON (%s)" % HAND_PRED), 4)
+
+
+def join_run(n=250, seed=2):
+    """Random join predicates against a correct database."""
+    rnd = random.Random(seed)
+    db = sqlite3.connect(":memory:")
+    alarms = split = tested = 0
+    for _ in range(n):
+        t1, t2 = tlp.build2(db, rnd, 6, 0.25)
+        pred = tlp.gen_join_predicate(rnd, t1, t2, 2)
+        try:
+            kept = db.execute("SELECT COUNT(*) FROM t1 JOIN t2 ON (%s)" % pred).fetchone()[0]
+            total = db.execute("SELECT COUNT(*) FROM t1, t2").fetchone()[0]
+            bad = tlp.join_check(db, pred) or tlp.leftjoin_check(db, pred)
+        except sqlite3.Error:
+            continue
+        tested += 1
+        alarms += bool(bad)
+        split += (0 < kept < total)
+    return alarms, split, tested
+
+
+alarms, split, tested = join_run()
+check("%d correct join queries raise no false alarms" % tested, alarms, 0)
+pct = 100 * split // tested
+ok("%d%% of join predicates actually split the cross product" % pct) if pct >= 40 else \
+    no("only %d%% of join predicates split the cross product" % pct,
+       "the rest keep everything or nothing, so the ON clause is doing no work")
+
+# Every predicate has to mention both tables, or it is a filter the planner
+# pushes down and the join is not being tested at all.
+rnd = random.Random(8)
+db = sqlite3.connect(":memory:")
+both = 0
+for _ in range(200):
+    t1, t2 = tlp.build2(db, rnd, 6, 0.25)
+    pred = tlp.gen_join_predicate(rnd, t1, t2, 2)
+    both += ("t1." in pred and "t2." in pred)
+check("every generated ON predicate mentions both tables", both, 200)
+
+
+def join_detection(kind, n=150, seed=0):
+    rnd = random.Random(seed)
+    real = sqlite3.connect(":memory:")
+    hits = {"inner": 0, "left": 0}
+    for _ in range(n):
+        t1, t2 = tlp.build2(real, rnd, 6, 0.25)
+        pred = tlp.gen_join_predicate(rnd, t1, t2, 2)
+        bent = tlp.Corrupt(real, kind)
+        for name, fn in (("inner", tlp.join_check), ("left", tlp.leftjoin_check)):
+            try:
+                if fn(bent, pred):
+                    hits[name] += 1
+            except sqlite3.Error:
+                pass
+    return hits["inner"] * 100 // n, hits["left"] * 100 // n
+
+
+i_drop, l_drop = join_detection("join-drop-pair")
+ok("a lost join pair is caught by the inner relation (%d%%)" % i_drop) if i_drop > 50 else \
+    no("a lost join pair is not caught", "%d%%" % i_drop)
+check("...and the left-join relation cannot see it", l_drop, 0)
+
+i_pad, l_pad = join_detection("leftjoin-overpad")
+ok("an over-padded outer join is caught by the left relation (%d%%)" % l_pad) if l_pad > 50 else \
+    no("an over-padded outer join is not caught", "%d%%" % l_pad)
+check("...and the inner relation never issues a LEFT JOIN, so it cannot", i_pad, 0)
+
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)

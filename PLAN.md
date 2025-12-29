@@ -12,7 +12,9 @@ tlp.py vacuity [--n N]               how often the generator is interesting
 tlp.py tlp     [--n N] [--seed S]    ternary partitioning
 tlp.py norec   [--n N] [--seed S]    optimised against unoptimised
 tlp.py agg     [--n N] [--seed S]    aggregate partitioning
+tlp.py join    [--n N] [--seed S]    partition a join's ON clause
 tlp.py selftest                      plant bugs, check the oracles notice
+tlp.py joinselftest                  the same, for the join relations
 tlp.py reduce  FILE                  shrink a found case to a minimal one
 ```
 
@@ -152,8 +154,36 @@ foreign keys, no virtual tables, no window functions.
 
 ### Later
 
-- [ ] 07 partition on a JOIN's ON clause rather than a WHERE, which is
+- [x] 07 partition on a JOIN's ON clause rather than a WHERE, which is
       where the published work found the most bugs
+      done: two relations, both derived and checked by hand on a worked
+            4x3 example before anything was built on them.
+            INNER: the three ON-partitions are a partition of the cross
+            product, because every pair makes the predicate exactly one of
+            the three values and an inner join keeps the TRUE ones.
+            LEFT: the same partitioning does NOT hold -- each arm pads its
+            own unmatched rows and the padding is counted three times. The
+            decomposition does: a left join is its inner join plus one row
+            per left row with no TRUE match. That brings NOT EXISTS into
+            the picture, which is a correlated subquery the optimiser
+            rewrites into something else entirely.
+            Every generated ON predicate is forced to mention both tables.
+            Without it the predicate is a filter the planner pushes down
+            and the join is not the join being tested. 65% genuinely split
+            the cross product.
+      proves: join-drop-pair  INNER 100%, LEFT   0%
+              leftjoin-overpad INNER  0%, LEFT 100%
+            Kept as its own table rather than folded into the single-table
+            one, because those oracles query t and these query t1 and t2 --
+            "TLP does not catch this" would only mean they were never
+            pointed at the same thing.
+      found: a hand-written expectation was wrong, again. The worked
+            example asserts the join keeps 3 pairs; the first version said
+            2. SQLite was right. The case stays, with the three TRUE pairs
+            enumerated in the comment, because a relation that has only
+            ever met generated data is a relation nobody has checked -- if
+            it were wrong the generator would produce thousands of cases
+            agreeing with it.
 - [x] 08 aggregate TLP: SUM, COUNT, MIN and MAX over the three partitions
       must reassemble, which needs a different composition rule per
       aggregate and is where this gets interesting
