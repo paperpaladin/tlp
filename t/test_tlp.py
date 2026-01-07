@@ -549,5 +549,181 @@ else:
     ok("every compound predicate offers a subtree to shrink to (max %d nodes)"
        % max(sizes))
 
+# -------------------------------------------- DISTINCT and GROUP BY
+#
+# These two need OPPOSITE composition rules, and each one is a false-alarm
+# generator in the other's place -- which is the same trap as the aggregate
+# table and the reason both are measured rather than asserted.
+#
+# DISTINCT recombines with UNION, a set union, because a value can appear
+# in two partitions: two rows sharing a value can land on opposite sides of
+# the predicate. GROUP BY must recombine with UNION ALL inside, because the
+# three partial counts for one group are the entire point and a set union
+# would collapse two arms that happened to count the same number of rows.
+
+def false_alarms(fn, n=200, seed=0, **kw):
+    """How often a relation accuses a database that is behaving correctly."""
+    rnd = random.Random(seed)
+    db = sqlite3.connect(":memory:")
+    alarms = tested = 0
+    for _ in range(n):
+        _, cols, _ = tlp.build(db, rnd, 8, 0.25)
+        pred = tlp.gen_predicate(rnd, cols, 2)
+        try:
+            bad = fn(db, pred, cols[0][0], **kw)
+        except sqlite3.Error:
+            continue
+        tested += 1
+        alarms += bool(bad)
+    return alarms, tested
+
+# The correct rules must never accuse a correct engine. This is the half
+# that makes the tool usable at all: every report costs a human reading a
+# schema and a query.
+#
+# Called with NO keyword, so the DEFAULT is what is under test. Passing
+# combine="UNION" explicitly -- which is what the first version of this did
+# -- tests a configuration no caller uses and leaves the shipped default
+# unchecked: changing the default to UNION ALL kept both of these green.
+# A parameterised test that always supplies the parameter has stopped
+# testing the thing that ships.
+check("the DISTINCT relation as shipped raises no false alarm",
+      false_alarms(tlp.distinct_check)[0], 0)
+check("the GROUP BY relation as shipped raises no false alarm",
+      false_alarms(tlp.group_check)[0], 0)
+check("...and the default composition rules are the correct ones",
+      (tlp.distinct_check.__defaults__, tlp.group_check.__defaults__),
+      (("UNION",), ("SUM",)))
+
+# And every wrong rule must raise them in quantity, or the right rule was
+# not load-bearing and the relation is not testing what it claims.
+# Floors as a FRACTION of what was tested, not a count: written as counts
+# they were sized for a 300-case sweep and silently became unreachable when
+# this runs 200, which failed loudly here but would elsewhere have been a
+# test that could never pass.
+for combine, floor in (("UNION ALL", 0.4), ("INTERSECT", 0.9), ("EXCEPT", 0.9)):
+    a, t = false_alarms(tlp.distinct_check, combine=combine)
+    if a >= floor * t:
+        ok("DISTINCT recombined with %s raises %d false alarms in %d"
+           % (combine, a, t))
+    else:
+        no("DISTINCT recombined with %s is not load-bearing" % combine,
+           "%d alarms in %d" % (a, t))
+
+for outer, floor in (("COUNT", 0.9), ("MIN", 0.4), ("MAX", 0.4), ("AVG", 0.4)):
+    a, t = false_alarms(tlp.group_check, outer=outer)
+    if a >= floor * t:
+        ok("GROUP BY counts recombined with %s raise %d false alarms in %d"
+           % (outer, a, t))
+    else:
+        no("GROUP BY counts recombined with %s is not load-bearing" % outer,
+           "%d alarms in %d" % (a, t))
+
+# UNION ALL for DISTINCT, and MIN/MAX/AVG for GROUP BY, all raise the SAME
+# number of false alarms -- and it is not a coincidence. Both fire exactly
+# when one value of the column lands in more than one partition: UNION ALL
+# then keeps it twice, and the per-arm counts then sum to more than any one
+# of them. The same event, seen from two sides.
+rnd = random.Random(0)
+db = sqlite3.connect(":memory:")
+spanning = 0
+for _ in range(200):
+    _, cols, _ = tlp.build(db, rnd, 8, 0.25)
+    pred = tlp.gen_predicate(rnd, cols, 2)
+    col = cols[0][0]
+    try:
+        arms = db.execute(
+            "SELECT COUNT(*) FROM ("
+            "  SELECT DISTINCT %s FROM t WHERE (%s)"
+            "  UNION ALL SELECT DISTINCT %s FROM t WHERE NOT (%s)"
+            "  UNION ALL SELECT DISTINCT %s FROM t WHERE (%s) IS NULL)"
+            % (col, pred, col, pred, col, pred)).fetchone()[0]
+        whole = db.execute(
+            "SELECT COUNT(*) FROM (SELECT DISTINCT %s FROM t)" % col).fetchone()[0]
+    except sqlite3.Error:
+        continue
+    spanning += (arms > whole)
+check("the UNION ALL false alarms are exactly the values that span partitions",
+      false_alarms(tlp.distinct_check, combine="UNION ALL")[0], spanning)
+check("...and so are the MIN ones",
+      false_alarms(tlp.group_check, outer="MIN")[0], spanning)
+
+# The DISTINCT relation leans on three operators agreeing about NULL:
+# DISTINCT, UNION and GROUP BY all treat two NULLs as the same value, while
+# `=` says NULL = NULL is NULL. If UNION used the `=` rule, a NULL coming
+# from two arms would survive twice and the relation would be false for
+# every table containing one. That assumption is cheap to check directly.
+probe = sqlite3.connect(":memory:")
+check("UNION treats two NULLs as the same value",
+      probe.execute("SELECT NULL UNION SELECT NULL").fetchall(), [(None,)])
+check("...and `=` does not",
+      probe.execute("SELECT NULL = NULL").fetchone()[0], None)
+check("...and GROUP BY agrees with UNION, not with `=`",
+      probe.execute("SELECT COUNT(*) FROM "
+                    "(SELECT NULL AS g UNION ALL SELECT NULL) GROUP BY g"
+                    ).fetchall(), [(2,)])
+
+
+def single_table_detection(kind, n=120, seed=0):
+    """Which of the five single-table relations notices a planted bug."""
+    rnd = random.Random(seed)
+    real = sqlite3.connect(":memory:")
+    hits = dict.fromkeys(("TLP", "NoREC", "agg", "DISTINCT", "GROUP"), 0)
+    for _ in range(n):
+        _, cols, _ = tlp.build(real, rnd, 8, 0.25)
+        pred = tlp.gen_predicate(rnd, cols, 2)
+        bent = tlp.Corrupt(real, kind)
+        ints = [c for c, ty in cols if ty == "INTEGER"]
+        for name, fn in (("TLP", tlp.tlp_check), ("NoREC", tlp.norec_check)):
+            try:
+                hits[name] += bool(fn(bent, pred))
+            except sqlite3.Error:
+                pass
+        for name, fn in (("DISTINCT", tlp.distinct_check), ("GROUP", tlp.group_check)):
+            try:
+                hits[name] += bool(fn(bent, pred, cols[0][0]))
+            except sqlite3.Error:
+                pass
+        if ints:
+            try:
+                hits["agg"] += bool(tlp.agg_check(bent, pred, "SUM", ints[0]))
+            except sqlite3.Error:
+                pass
+    return {k: v * 100 // n for k, v in hits.items()}
+
+
+# Each new relation catches exactly the class it was built for. These two
+# bugs leave every row present, every count right and every whole-table
+# aggregate right, so nothing that does not write DISTINCT or GROUP BY can
+# see them -- which is the argument for carrying five relations.
+d = single_table_detection("distinct-dup")
+ok("a duplicate in a DISTINCT result is caught by the DISTINCT relation (%d%%)"
+   % d["DISTINCT"]) if d["DISTINCT"] > 50 else \
+    no("a duplicate in a DISTINCT result is not caught", repr(d))
+check("...and no other relation writes DISTINCT, so none can see it",
+      [d[k] for k in ("TLP", "NoREC", "agg", "GROUP")], [0, 0, 0, 0])
+
+g = single_table_detection("group-skew")
+ok("one group counted wrong is caught by the GROUP BY relation (%d%%)"
+   % g["GROUP"]) if g["GROUP"] > 50 else \
+    no("one group counted wrong is not caught", repr(g))
+check("...and nothing else groups, so nothing else can see it",
+      [g[k] for k in ("TLP", "NoREC", "agg", "DISTINCT")], [0, 0, 0, 0])
+
+# The DISTINCT relation reads 0% against `drop-row`, and the tempting
+# reading is that it cannot see a lost row. It is not what is measured:
+# `drop-row` fires on "UNION ALL" and this relation recombines with
+# "UNION". Widening the bug to any set operation separates the two
+# explanations -- and the column moves off zero, so the relation sees lost
+# rows fine and it was the bug that could not see the relation.
+narrow = single_table_detection("drop-row")
+wide = single_table_detection("setop-drop-row")
+check("a UNION-ALL-only lost row is invisible to the DISTINCT relation",
+      narrow["DISTINCT"], 0)
+ok("...because of the trigger, not the relation: widened, it is caught (%d%%)"
+   % wide["DISTINCT"]) if wide["DISTINCT"] > 50 else \
+    no("the DISTINCT relation cannot see a lost row even when widened",
+       repr(wide))
+
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)

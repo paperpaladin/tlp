@@ -9,12 +9,15 @@ $ python3 tlp.py tlp --n 500
 TLP: 500 queries, 0 disagreements, 0 skipped, 152 genuinely three-valued (30%)
 
 $ python3 tlp.py selftest
-planted bug               TLP    NoREC      agg
-drop-row                 100%       0%       0%
-duplicate-row            100%       0%       0%
-null-only                 23%       0%       0%
-count-off-by-one           0%     100%       0%
-aggregate-skew             0%       0%      85%
+planted bug               TLP    NoREC      agg  DISTINCT    GROUP
+drop-row                 100%       0%       0%        0%      80%
+duplicate-row            100%       0%       0%        0%     100%
+null-only                 21%       0%       0%        0%      21%
+count-off-by-one           0%     100%       0%        0%       0%
+aggregate-skew             0%       0%      86%        0%       0%
+distinct-dup               0%       0%       0%      100%       0%
+group-skew                 0%       0%       0%        0%     100%
+setop-drop-row           100%       0%       0%       80%      80%
 
 every planted bug is caught by at least one oracle
 ```
@@ -87,6 +90,25 @@ was built for and **nothing else**:
 - NoREC only ever compares two numbers, so it cannot see which rows moved.
 - Both compare rows or counts, so neither can see an aggregate that is
   wrong while every row is present and every count agrees.
+- None of the three writes `DISTINCT`, so a dedup step skipped on one path
+  is invisible to all of them.
+- None of the four groups, so one group counted wrong -- with every row
+  present, every count right and every whole-table aggregate right -- is
+  invisible to all of them.
+
+### One zero in that table is not what it looks like
+
+The `DISTINCT` column reads 0% against `drop-row`, and the tempting
+reading is that the relation cannot see a lost row. It cannot be read that
+way, because `drop-row` is *written* to fire on `UNION ALL` and the
+`DISTINCT` relation recombines with `UNION`. The 0% is a property of the
+planted bug's trigger, not of the relation.
+
+Separating the two explanations costs one more planted bug. `setop-drop-row`
+is the same lost row fired on any set operation, and the `DISTINCT` column
+moves to 80% -- so the relation sees lost rows fine, and it was the bug
+that could not see the relation. The last row of the table exists only to
+answer that question, and without it the table would be quietly overclaiming.
 
 ### The composition rules are load-bearing
 
@@ -104,6 +126,69 @@ Every correct rule raises **no** false alarms; every wrong one raises
 hundreds. `COUNT` is the one to stare at: its combiner is `SUM`, and
 writing `COUNT` there by analogy with the others -- the obvious mistake --
 produces a tool that reports a bug in 208 of 210 correct queries.
+
+## DISTINCT and GROUP BY need opposite composition rules
+
+Each of these is the partitioning done over a query shape where the obvious
+recombination is the wrong one -- the same trap as the aggregate table, and
+worth meeting twice because the two traps point in opposite directions.
+
+**`DISTINCT` recombines with `UNION`**, a set union, and it is the only
+relation here that does not use `UNION ALL`. The three partitions still
+cover every row, so every distinct value appears in at least one arm -- but
+a value can appear in *two*, because two rows sharing a value can land on
+opposite sides of the predicate:
+
+```sql
+  SELECT DISTINCT c FROM t WHERE p
+    UNION SELECT DISTINCT c FROM t WHERE NOT p
+    UNION SELECT DISTINCT c FROM t WHERE p IS NULL
+==  SELECT DISTINCT c FROM t
+```
+
+**`GROUP BY` must recombine with `UNION ALL` inside**, for exactly the
+reason `DISTINCT` must not. A group's rows are split across the three
+partitions, so each arm holds part of every group, and the three partial
+counts are the entire point -- a set union would collapse two arms that
+happened to count the same number of rows. Then the counts are
+re-aggregated per group, which is the `COUNT`-recombines-with-`SUM` rule
+from the aggregate table applied group by group:
+
+```sql
+  SELECT g, SUM(n) FROM (
+      SELECT g, COUNT(*) AS n FROM t WHERE p GROUP BY g
+      UNION ALL SELECT g, COUNT(*) FROM t WHERE NOT p GROUP BY g
+      UNION ALL SELECT g, COUNT(*) FROM t WHERE p IS NULL GROUP BY g
+  ) GROUP BY g
+==  SELECT g, COUNT(*) FROM t GROUP BY g
+```
+
+So each relation's rule is a false-alarm generator in the other's place,
+measured against a database that is behaving correctly:
+
+| `DISTINCT` recombined with | false alarms | | `GROUP BY` counts recombined with | false alarms |
+|---|---|---|---|---|
+| **`UNION`** | **0 / 200** | | **`SUM`** | **0 / 200** |
+| `UNION ALL` | 113 | | `COUNT` | 196 |
+| `INTERSECT` | 200 | | `MIN` | 113 |
+| `EXCEPT` | 198 | | `MAX` | 113 |
+| | | | `AVG` | 113 |
+
+The `113` is the same number four times over, and it is the same event seen
+from two sides: one value of the column landing in more than one partition.
+`UNION ALL` then keeps it twice, and the per-arm counts then sum to more
+than any single one of them. Measured directly -- a value spans partitions
+in exactly 113 of those 200 cases -- rather than left as a coincidence.
+
+### A hidden dependency on three operators agreeing about NULL
+
+The `DISTINCT` relation quietly rests on something the SQL standard makes
+easy to miss. `DISTINCT`, `UNION` and `GROUP BY` all treat two NULLs as the
+*same* value, while `=` says `NULL = NULL` is NULL. If `UNION` followed the
+`=` rule, a NULL arriving from two arms would survive twice and the
+relation would be false for every table containing one. The suite checks
+all three operators directly rather than trusting that reading of the
+standard.
 
 ## Partitioning a join's ON clause
 
@@ -285,9 +370,12 @@ shrink the SCHEMA -- an unused column stays in the `CREATE TABLE` even when
 no surviving part of the predicate mentions it, which is visible in the
 worked example above.
 
-`DISTINCT` and `GROUP BY` partitioning are not implemented. Only two
-tables are joined, never three, so join *reordering* -- which is where a
-planner has the most freedom to be wrong -- is barely exercised.
+`GROUP BY` is partitioned only for `COUNT(*)`, and only on a single
+grouping column. `HAVING` is never generated, which is a real gap: it is
+where the grouped equivalent of a pushed-down predicate goes wrong.
+
+Only two tables are joined, never three, so join *reordering* -- which is
+where a planner has the most freedom to be wrong -- is barely exercised.
 
 ## The one hand-written thing, and why
 
@@ -315,7 +403,7 @@ equivalent mutant rather than a hole.
 
 ```
 $ make test
-65 passed, 0 failed
+86 passed, 0 failed
 ```
 
 No pytest, no network, no dependencies. `sqlite3` is in the standard

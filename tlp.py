@@ -412,7 +412,8 @@ def run_oracle(args, check, label):
             print("FOUND  %s disagreement on seed step %d" % (bad[0], i))
             print("  %s" % ddl)
             for r in rows:
-                print("  INSERT INTO t VALUES %r;" % (r,))
+                print("  INSERT INTO t VALUES (%s);"
+                      % ", ".join(sql_literal(v) for v in r))
             print("  predicate: %s" % pred)
             print("  %s says %r, the other form says %r" % (bad[0], bad[1], bad[2]))
             if found >= args.max_reports:
@@ -824,7 +825,8 @@ def cmd_agg(args):
                 print("FOUND  %s disagreement at step %d" % (bad[0], i))
                 print("  %s" % ddl)
                 for r in rows:
-                    print("  INSERT INTO t VALUES %r;" % (r,))
+                    print("  INSERT INTO t VALUES (%s);"
+                          % ", ".join(sql_literal(v) for v in r))
                 print("  predicate: %s" % pred)
                 print("  whole %r, recombined %r" % (bad[1], bad[2]))
                 if found >= args.max_reports:
@@ -835,6 +837,88 @@ def cmd_agg(args):
     print("  per aggregate: %s" %
           ", ".join("%s %d" % (a, n) for a, n in sorted(per_agg.items())))
     return 1 if found else 0
+
+
+# --------------------------------------------- DISTINCT and GROUP BY
+#
+# Both are the partitioning done over a query shape where the obvious
+# composition rule is the wrong one, which is the same trap as the
+# aggregate table and worth meeting twice.
+#
+# DISTINCT. The three partitions still cover every row, so every distinct
+# value of a column appears in at least one arm. But a value can appear in
+# TWO arms -- two different rows can share a value and land on opposite
+# sides of the predicate -- so the arms are recombined with UNION, which is
+# a set union, rather than the UNION ALL every other relation here uses:
+#
+#     SELECT DISTINCT c FROM t WHERE p
+#       UNION SELECT DISTINCT c FROM t WHERE NOT p
+#       UNION SELECT DISTINCT c FROM t WHERE p IS NULL
+#     ==  SELECT DISTINCT c FROM t
+#
+# This relation quietly depends on three separate operators agreeing about
+# NULL. DISTINCT, UNION and GROUP BY all treat two NULLs as the same value,
+# while `=` says NULL = NULL is NULL. If UNION used the `=` rule, a NULL
+# from two arms would survive twice and the relation would be false for
+# every table containing a NULL.
+#
+# GROUP BY. A group's rows are split across the three partitions, so each
+# arm sees part of every group and the counts have to be re-aggregated per
+# group. That is the COUNT-recombines-with-SUM rule from the aggregate
+# table, now applied group by group:
+#
+#     SELECT g, SUM(n) FROM (
+#         SELECT g, COUNT(*) AS n FROM t WHERE p GROUP BY g
+#         UNION ALL SELECT g, COUNT(*) FROM t WHERE NOT p GROUP BY g
+#         UNION ALL SELECT g, COUNT(*) FROM t WHERE p IS NULL GROUP BY g
+#     ) GROUP BY g
+#     ==  SELECT g, COUNT(*) FROM t GROUP BY g
+#
+# Here the inner composition MUST be UNION ALL -- the three partial counts
+# for one group are the whole point and a set union would collapse two
+# arms that happened to count the same number of rows.
+#
+# So the two relations need opposite composition rules, and each one is a
+# false-alarm generator in the other's place. That is measured in the
+# suite rather than asserted.
+
+
+def distinct_check(db, pred, col, combine="UNION"):
+    """Distinct values of a column, against the same set recombined."""
+    whole = rows_of(db, "SELECT DISTINCT %s FROM t" % col)
+    arms = (" %s " % combine).join(
+        "SELECT DISTINCT %s FROM t WHERE %s" % (col, arm)
+        for arm in ("(%s)" % pred, "NOT (%s)" % pred, "(%s) IS NULL" % pred))
+    parts = rows_of(db, arms)
+    if whole == parts:
+        return None
+    return ("DISTINCT", len(whole), len(parts))
+
+
+def group_check(db, pred, col, outer="SUM"):
+    """Per-group counts over the whole table, against them recombined."""
+    whole = rows_of(db, "SELECT %s, COUNT(*) FROM t GROUP BY %s" % (col, col))
+    parts = rows_of(db,
+                    "SELECT %s, %s(n) FROM ("
+                    "  SELECT %s, COUNT(*) AS n FROM t WHERE (%s) GROUP BY %s"
+                    "  UNION ALL SELECT %s, COUNT(*) FROM t WHERE NOT (%s) GROUP BY %s"
+                    "  UNION ALL SELECT %s, COUNT(*) FROM t WHERE (%s) IS NULL GROUP BY %s"
+                    ") GROUP BY %s"
+                    % (col, outer, col, pred, col, col, pred, col,
+                       col, pred, col, col))
+    if whole == parts:
+        return None
+    return ("GROUP BY", len(whole), len(parts))
+
+
+def cmd_distinct(args):
+    return run_oracle(args, lambda db, pred: distinct_check(db, pred, "c0"),
+                      "DISTINCT")
+
+
+def cmd_group(args):
+    return run_oracle(args, lambda db, pred: group_check(db, pred, "c0"),
+                      "GROUP BY")
 
 
 # ------------------------------------------------------------- selftest
@@ -927,11 +1011,44 @@ class Corrupt:
         if k == "leftjoin-overpad" and "LEFT JOIN" in sql and rows \
                 and rows[0][0] is not None:
             return [(rows[0][0] + 1,)]
+        # The same lost row, but fired on ANY set operation rather than on
+        # UNION ALL specifically. This bug exists to answer a question
+        # about the table rather than to model a new defect.
+        #
+        # The DISTINCT relation reads 0% against `drop-row` above, and the
+        # tempting reading is that it cannot see a lost row. That is not
+        # what is being measured: `drop-row` is written to fire on
+        # "UNION ALL" and the DISTINCT relation recombines with "UNION",
+        # so the 0% is a property of the trigger string. Widening it to
+        # "UNION" separates the two explanations, and the DISTINCT column
+        # moves off zero -- so the relation sees lost rows fine, and it
+        # was the bug that could not see the relation.
+        if k == "setop-drop-row" and "UNION" in sql and len(rows) > 3:
+            return rows[:-1]
+        # A DISTINCT that returns a value twice: a dedup step skipped on one
+        # path. No other relation here ever writes DISTINCT, so no other
+        # relation can see it.
+        #
+        # "UNION" not in sql is the lesson from aggregate-skew applied
+        # before making the mistake again: the recombined side is three
+        # SELECT DISTINCTs joined by UNION, and corrupting that too would
+        # have this bug "caught" by a relation that had only noticed the
+        # wrapper breaking the relation.
+        if k == "distinct-dup" and sql.startswith("SELECT DISTINCT") \
+                and "UNION" not in sql and rows:
+            return rows + rows[:1]
+        # One group counted one row too many. Invisible to everything that
+        # does not group: the rows all reassemble, the whole-table count is
+        # right, and the whole-table aggregate is right.
+        if k == "group-skew" and "GROUP BY" in sql and "UNION" not in sql \
+                and rows and rows[0][1] is not None:
+            return [(rows[0][0], rows[0][1] + 1)] + rows[1:]
         return rows
 
 
 BUG_KINDS = ["drop-row", "duplicate-row", "null-only", "count-off-by-one",
-             "aggregate-skew"]
+             "aggregate-skew", "distinct-dup", "group-skew",
+             "setop-drop-row"]
 
 
 JOIN_BUG_KINDS = ["join-drop-pair", "leftjoin-overpad"]
@@ -979,10 +1096,11 @@ def cmd_selftest(args):
     import random
     real = sqlite3.connect(":memory:")
 
-    print("%-20s %8s %8s %8s" % ("planted bug", "TLP", "NoREC", "agg"))
+    print("%-20s %8s %8s %8s %9s %8s"
+          % ("planted bug", "TLP", "NoREC", "agg", "DISTINCT", "GROUP"))
     worst = {}
     for kind in BUG_KINDS:
-        hits = {"TLP": 0, "NoREC": 0, "agg": 0}
+        hits = {"TLP": 0, "NoREC": 0, "agg": 0, "DISTINCT": 0, "GROUP": 0}
         rnd = random.Random(args.seed)
         for _ in range(args.n):
             _, cols, _ = build(real, rnd, args.rows, args.null_rate)
@@ -1002,10 +1120,19 @@ def cmd_selftest(args):
                         hits["agg"] += 1
                 except sqlite3.Error:
                     pass
-        print("%-20s %7d%% %7d%% %7d%%" % (kind,
-                                           100 * hits["TLP"] // args.n,
-                                           100 * hits["NoREC"] // args.n,
-                                           100 * hits["agg"] // args.n))
+            for name, fn in (("DISTINCT", distinct_check), ("GROUP", group_check)):
+                try:
+                    if fn(bent, pred, cols[0][0]):
+                        hits[name] += 1
+                except sqlite3.Error:
+                    pass
+        print("%-20s %7d%% %7d%% %7d%% %8d%% %7d%%"
+              % (kind,
+                 100 * hits["TLP"] // args.n,
+                 100 * hits["NoREC"] // args.n,
+                 100 * hits["agg"] // args.n,
+                 100 * hits["DISTINCT"] // args.n,
+                 100 * hits["GROUP"] // args.n))
         worst[kind] = max(hits.values())
 
     missed = [k for k, v in worst.items() if v == 0]
@@ -1048,7 +1175,9 @@ def main():
     p.set_defaults(fn=cmd_vacuity)
 
     for name, fn, helptext in (("tlp", cmd_tlp, "ternary partitioning"),
-                               ("norec", cmd_norec, "optimised vs unoptimised")):
+                               ("norec", cmd_norec, "optimised vs unoptimised"),
+                               ("distinct", cmd_distinct, "partition a DISTINCT"),
+                               ("group", cmd_group, "partition a GROUP BY")):
         q = sub.add_parser(name, help=helptext)
         q.add_argument("--n", type=int, default=500)
         q.add_argument("--seed", type=int, default=0)
