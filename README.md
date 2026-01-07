@@ -160,6 +160,68 @@ that it is a filter on one side, the planner pushes it down, and the join
 being tested is not the join it appears to be. 65% of them genuinely split
 the cross product rather than keeping all of it or none.
 
+## Shrinking a case to something a human will read
+
+A found case is a schema, ten rows and a predicate like
+`((c1 IS NOT NULL OR c0 <= 2) AND NOT (c2 = c0 OR c3 < 'bb'))`. Nobody
+reads that, so an unreduced report is the same as no report.
+
+The shrink is greedy delta debugging over three axes -- drop a row, replace
+a predicate with one of its own subtrees, pull a value toward NULL --
+keeping any change that leaves the case still failing.
+
+**The only property that matters is soundness: what comes out must still
+fail.** A reducer that shrinks past the bug emits a minimal case that
+reproduces nothing and sends whoever reads it hunting for a bug that is not
+there, which is strictly worse than printing the unreduced version. Every
+reduction asserts it on its own output:
+
+```
+$ python3 tlp.py reduce --bug null-only
+found at try 2, against the planted bug 'null-only'
+  rows       10 -> 3
+  predicate  13 nodes -> 1
+
+CREATE TABLE t (c0 INTEGER, c1 TEXT, c2 INTEGER, c3 TEXT);
+INSERT INTO t VALUES (NULL, NULL, NULL, NULL);
+INSERT INTO t VALUES (NULL, NULL, NULL, NULL);
+INSERT INTO t VALUES (NULL, NULL, NULL, NULL);
+-- predicate: c0 IS NULL
+-- still fails after reduction: True
+```
+
+That output is worth reading twice. `null-only` is the narrow planted bug:
+it fires only above two rows and only when the predicate itself mentions
+NULL. The reducer was told neither thing, and landed on exactly three rows
+and exactly `c0 IS NULL`. It rediscovered the bug's trigger condition by
+shrinking, which is what a reducer is for.
+
+Because the bugs are planted, their true floors are known, so the suite can
+assert the reducer reaches them rather than merely getting smaller:
+
+| planted bug | fires when | floor | reached |
+|---|---|---|---|
+| `drop-row` | partition returns > 3 rows | 4 rows | 4 |
+| `duplicate-row` | any non-empty result | 1 row | 1 |
+| `null-only` | > 2 rows, NULL in the predicate | 3 rows | 3 |
+
+"Smaller than before" would be satisfied by a reducer that drops one row
+and gives up. Hitting the floor is a measurement.
+
+### The shrink order has to be well-founded
+
+The value axis looks like the easy one and is the only part that went
+wrong. The first version offered every value NULL and 0 as candidates,
+counted any accepted swap as progress, and **never terminated**: NULL
+became 0, then 0 became NULL, forever, each step looking locally like an
+improvement.
+
+So candidates are now strictly below the current value on a total order --
+NULL, then 0 or the empty string, then everything else -- and the suite
+asserts no candidate leads back to the value it replaced. Deleting the
+strictness makes the test run hang rather than fail, which is the honest
+way for that mutation to show up.
+
 ## The generator decides whether any of this means anything
 
 TLP splits rows three ways. A predicate that is never NULL leaves the third
@@ -218,6 +280,11 @@ order is never compared, only sorted multisets, because SQL does not
 promise an order without `ORDER BY` and comparing sequences would report a
 bug every time the planner legitimately changed its mind.
 
+The reducer shrinks rows, the predicate tree and values. It does not
+shrink the SCHEMA -- an unused column stays in the `CREATE TABLE` even when
+no surviving part of the predicate mentions it, which is visible in the
+worked example above.
+
 `DISTINCT` and `GROUP BY` partitioning are not implemented. Only two
 tables are joined, never three, so join *reordering* -- which is where a
 planner has the most freedom to be wrong -- is barely exercised.
@@ -248,7 +315,7 @@ equivalent mutant rather than a hole.
 
 ```
 $ make test
-48 passed, 0 failed
+65 passed, 0 failed
 ```
 
 No pytest, no network, no dependencies. `sqlite3` is in the standard

@@ -231,15 +231,50 @@ def lit(rnd, ty):
     return "'%s'" % rnd.choice(TEXTS)
 
 
-def gen_predicate(rnd, cols, depth=2):
+# A predicate is generated as a TREE and rendered on demand, because the
+# reducer has to be able to replace a node with one of its own subtrees and
+# a finished string cannot be taken apart again without parsing it back.
+# Everything else still works in strings; gen_predicate() is the same
+# function it always was, with one render() in front of it.
+#
+#   ("atom", text) | ("not", a) | ("and", a, b) | ("or", a, b)
+
+
+def render(node):
+    k = node[0]
+    if k == "atom":
+        return node[1]
+    if k == "not":
+        return "(NOT %s)" % render(node[1])
+    return "(%s %s %s)" % (render(node[1]), k.upper(), render(node[2]))
+
+
+def tree_size(node):
+    return 1 + sum(tree_size(c) for c in node[1:] if isinstance(c, tuple))
+
+
+def subtrees(node):
+    """Every proper subtree. Candidates for replacing the whole."""
+    out = []
+    for child in node[1:]:
+        if isinstance(child, tuple):
+            out.append(child)
+            out.extend(subtrees(child))
+    return out
+
+
+def gen_tree(rnd, cols, depth=2):
     if depth <= 0 or rnd.random() < 0.3:
-        return gen_atom(rnd, cols)
+        return ("atom", gen_atom(rnd, cols))
     k = rnd.random()
     if k < 0.20:
-        return "(NOT %s)" % gen_predicate(rnd, cols, depth - 1)
-    op = "AND" if k < 0.60 else "OR"
-    return "(%s %s %s)" % (gen_predicate(rnd, cols, depth - 1), op,
-                           gen_predicate(rnd, cols, depth - 1))
+        return ("not", gen_tree(rnd, cols, depth - 1))
+    return ("and" if k < 0.60 else "or",
+            gen_tree(rnd, cols, depth - 1), gen_tree(rnd, cols, depth - 1))
+
+
+def gen_predicate(rnd, cols, depth=2):
+    return render(gen_tree(rnd, cols, depth))
 
 
 # ------------------------------------------------------------- vacuity
@@ -398,6 +433,152 @@ def cmd_tlp(args):
 
 def cmd_norec(args):
     return run_oracle(args, norec_check, "NoREC")
+
+
+# -------------------------------------------------------------- reducing
+#
+# A found case is a schema, eight rows and a predicate with seven nodes in
+# it. Nobody reads that, which makes it the same as no report. Shrinking is
+# not a nicety here; it is what turns the output into something a person
+# can act on.
+#
+# Greedy delta debugging over three axes, repeated until none of them
+# moves:
+#
+#   rows        drop one, keep the drop if the case still fails
+#   predicate   replace a node with one of its own subtrees
+#   values      pull a literal toward NULL, 0 or the empty string
+#
+# The one invariant that matters is SOUNDNESS: whatever comes out must
+# still fail. A reducer that shrinks past the bug produces a minimal case
+# that reproduces nothing, and sends whoever reads it looking for a bug
+# that is not there -- worse than printing the unreduced version. The suite
+# asserts it on every reduction it performs.
+
+
+def sql_literal(v):
+    """A Python value as the SQL that produces it.
+
+    The point of a reduced case is that someone can paste it into sqlite3,
+    and Python's repr of a row gives `(None, 'aa')` -- which is not SQL.
+    """
+    if v is None:
+        return "NULL"
+    if isinstance(v, str):
+        return "'%s'" % v.replace("'", "''")
+    return str(v)
+
+
+def simpler_than(v, ty):
+    """The candidate values strictly below `v` in the simplicity order.
+
+    NULL, then 0 or the empty string, then everything else. STRICTLY below:
+    offering every candidate for every value instead makes the shrink
+    oscillate -- NULL becomes 0, then 0 becomes NULL, each one counting as
+    progress -- and the reducer never returns. That is not hypothetical,
+    it is what the first version of this did, and it is why a shrink needs
+    a well-founded order rather than a set of rewrites that each look like
+    an improvement.
+    """
+    floor = 0 if ty == "INTEGER" else ""
+    if v is None:
+        return ()
+    if v == floor and type(v) is type(floor):
+        return (None,)
+    return (None, floor)
+
+
+def reduce_case(fails, cols, rows, tree):
+    """Shrink (rows, tree) while `fails(rows, predicate_text)` holds.
+
+    `fails` rebuilds the table and re-runs the oracle, so this makes no
+    assumption about which oracle found the case or what the bug is.
+    """
+    if not fails(rows, render(tree)):
+        raise ValueError("the case does not fail, so there is nothing to reduce")
+
+    moved = True
+    while moved:
+        moved = False
+
+        # Rows first: they dominate how a report reads.
+        i = 0
+        while i < len(rows):
+            trial = rows[:i] + rows[i + 1:]
+            if trial and fails(trial, render(tree)):
+                rows = trial
+                moved = True
+            else:
+                i += 1
+
+        # Then the predicate, trying the largest subtree first so that one
+        # accepted replacement removes as much as possible.
+        for sub in sorted(subtrees(tree), key=tree_size, reverse=True):
+            if fails(rows, render(sub)):
+                tree = sub
+                moved = True
+                break
+
+        # Then the values. A value that can be simplified was never part of
+        # what made the case fail, and "0" reads better than "3" in a
+        # report that someone has to reason about.
+        for i in range(len(rows)):
+            for j, (_, ty) in enumerate(cols):
+                for cand in simpler_than(rows[i][j], ty):
+                    trial = list(rows)
+                    trial[i] = rows[i][:j] + (cand,) + rows[i][j + 1:]
+                    if fails(trial, render(tree)):
+                        rows = trial
+                        moved = True
+                        break
+
+    return rows, tree
+
+
+def cmd_reduce(args):
+    """Find a case against a planted bug, then shrink it.
+
+    Pointed at a planted bug rather than at SQLite because there are no
+    real cases to reduce -- and because a reducer can only be tested
+    against a failure whose cause is already known.
+    """
+    import random
+    rnd = random.Random(args.seed)
+    db = sqlite3.connect(":memory:")
+
+    for i in range(args.tries):
+        _, cols, rows = build(db, rnd, args.rows, args.null_rate)
+        tree = gen_tree(rnd, cols, args.depth)
+
+        def fails(trial_rows, pred, cols=cols):
+            db.execute("DROP TABLE IF EXISTS t")
+            db.execute("CREATE TABLE t (%s)" % ", ".join("%s %s" % c for c in cols))
+            db.executemany("INSERT INTO t VALUES (%s)" % ",".join("?" * len(cols)),
+                           trial_rows)
+            try:
+                return tlp_check(Corrupt(db, args.bug), pred) is not None
+            except sqlite3.Error:
+                return False
+
+        if not fails(rows, render(tree)):
+            continue
+
+        before = (len(rows), tree_size(tree))
+        rows2, tree2 = reduce_case(fails, cols, list(rows), tree)
+
+        print("found at try %d, against the planted bug %r" % (i + 1, args.bug))
+        print("  rows       %d -> %d" % (before[0], len(rows2)))
+        print("  predicate  %d nodes -> %d" % (before[1], tree_size(tree2)))
+        print()
+        print("CREATE TABLE t (%s);" % ", ".join("%s %s" % c for c in cols))
+        for r in rows2:
+            print("INSERT INTO t VALUES (%s);" % ", ".join(sql_literal(v) for v in r))
+        print("-- predicate: %s" % render(tree2))
+        print("-- still fails after reduction: %s" % fails(rows2, render(tree2)))
+        return 1
+
+    print("no case found in %d tries" % args.tries)
+    return 0
 
 
 # ------------------------------------------------------ join partitioning
@@ -878,6 +1059,15 @@ def main():
         q.add_argument("--no-index", action="store_false", dest="index")
         q.add_argument("--max-reports", type=int, default=3, dest="max_reports")
         q.set_defaults(fn=fn)
+
+    p = sub.add_parser("reduce", help="find a case against a planted bug and shrink it")
+    p.add_argument("--bug", default="drop-row", choices=BUG_KINDS)
+    p.add_argument("--tries", type=int, default=2000)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--rows", type=int, default=10)
+    p.add_argument("--depth", type=int, default=3)
+    p.add_argument("--null-rate", type=float, default=0.25, dest="null_rate")
+    p.set_defaults(fn=cmd_reduce)
 
     p = sub.add_parser("join", help="partition a join's ON clause")
     p.add_argument("--n", type=int, default=400)

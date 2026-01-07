@@ -15,7 +15,7 @@ tlp.py agg     [--n N] [--seed S]    aggregate partitioning
 tlp.py join    [--n N] [--seed S]    partition a join's ON clause
 tlp.py selftest                      plant bugs, check the oracles notice
 tlp.py joinselftest                  the same, for the join relations
-tlp.py reduce  FILE                  shrink a found case to a minimal one
+tlp.py reduce  [--bug K]             shrink a found case to a minimal one
 ```
 
 Exit status: 0 nothing found, 1 a disagreement was found, 2 usage error.
@@ -147,10 +147,59 @@ foreign keys, no virtual tables, no window functions.
             are so NULL-heavy that the TRUE and FALSE arms empty out
             instead and 13% of predicates become constant. 0.25 is the
             peak at 32%, and the sweep is in the README.
-- [ ] 06 `tlp reduce` -- shrink a failing case to a minimal schema,
+- [x] 06 `tlp reduce` -- shrink a failing case to a minimal schema,
       dataset and predicate
       why: an unreduced report is a thousand rows and a predicate nobody
            will read, which is the same as no report.
+      done: greedy delta debugging over three axes -- drop a row, replace a
+            predicate node with one of its own subtrees, pull a value
+            toward NULL. Needed the generator refactored to hand back a
+            TREE rather than a finished string; `gen_predicate` is now
+            `render(gen_tree(...))` so every existing oracle is unchanged,
+            which was checked by the suite staying green at the same
+            numbers across the refactor.
+      proves: SOUNDNESS, which is the only property that matters -- what
+            comes out must still fail. A reducer that shrinks past the bug
+            emits a minimal case reproducing nothing and sends its reader
+            hunting for a bug that is not there, which is worse than
+            printing the unreduced case. Asserted on every reduction the
+            suite performs.
+            And because the bugs are planted their true floors are known,
+            so effectiveness is a measurement rather than a smoke test:
+              drop-row       fires above 3 rows  -> reduces to exactly 4
+              duplicate-row  fires on any rows   -> reduces to exactly 1
+              null-only      fires above 2 rows  -> reduces to exactly 3
+            "Smaller than before" would be satisfied by a reducer that
+            drops one row and gives up.
+            The null-only case is the one worth looking at: that bug also
+            requires the predicate to mention NULL, the reducer was told
+            neither condition, and it landed on 3 rows and `c0 IS NULL`.
+            It rediscovered the trigger by shrinking.
+      found: the shrink order was not well-founded and the reducer did not
+            terminate. The value axis offered both NULL and 0 to every
+            value and counted any accepted swap as progress, so NULL became
+            0 and 0 became NULL forever, each step locally an improvement.
+            Candidates are now strictly below the current value on a total
+            order and the suite asserts no candidate leads back. Removing
+            the strictness makes the suite HANG rather than fail, which is
+            how that mutation honestly shows up.
+      found: the reduced-case printer emitted Python, not SQL. Rows came
+            out as `INSERT INTO t VALUES (None, None);` -- and the entire
+            value of a reduced case is that it can be pasted into sqlite3.
+            The suite now re-executes the printed INSERTs and compares the
+            multiset it gets back.
+      found: and that round-trip test was itself broken, exposed by a
+            mutation rather than by a passing run. It compared with
+            `sorted()`, which raises on a row mixing NULL with an integer;
+            every case that happened to be green was all-NULL, so it never
+            fired. Comparing `Counter`s is both correct and the right
+            relation, since these are multisets.
+      survived: breaking soundness -- dropping a row without re-checking --
+            is caught for drop-row and null-only but NOT for
+            duplicate-row, which is an equivalent mutant: that bug fires on
+            any non-empty result, so dropping rows unconditionally lands on
+            its real floor of 1 and the case still fails. Recorded rather
+            than chased.
 
 ### Later
 
