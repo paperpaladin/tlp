@@ -313,11 +313,35 @@ foreign keys, no virtual tables, no window functions.
             rather than SQL, the same defect the reducer had. Both now use
             sql_literal.
 
+- [ ] 10 HAVING partitioning
+      why: HAVING is where the grouped equivalent of a pushed-down
+           predicate goes wrong, and item 09 deliberately left it out.
+           The relation is not the obvious one: a HAVING clause filters
+           GROUPS, so partitioning it does not partition rows at all, and
+           the three arms have to be recombined on the group key.
+- [ ] 11 a third table in the join, so reordering is actually exercised
+      why: item 07 joins exactly two tables, which gives the planner
+           almost no freedom to reorder -- and reordering is where it has
+           the most freedom to be wrong. The README says so plainly and
+           that admission is the reason this is next rather than later.
+- [ ] 12 LIKE and GLOB, with BINARY pinned explicitly
+      why: a rich source of behaviour, and the reason it has been deferred
+           is in the open questions below. Pinning the collation is what
+           keeps it inside the hard invariant rather than outside it.
+
 ## Open questions
 
 - Whether to generate `LIKE` and `GLOB`. They are a rich source of
   behaviour but drag in collation, which the hard invariant excludes.
   Probably yes with `BINARY` pinned explicitly.
-- Reduction strategy: delta debugging over the predicate tree is the
-  obvious approach, but shrinking the DATA is usually what makes a report
-  readable, and the two interact.
+- RESOLVED by item 06. Reduction does both, and the data axis matters
+  more: rows go 10 -> 1 while predicates go 13 nodes -> 1. The two
+  interact in the direction that helps, since a smaller predicate makes
+  more rows droppable. The axis that caused trouble was neither -- it was
+  shrinking VALUES, which needs a well-founded order or the loop runs
+  forever.
+- Whether the schema should shrink too. An unused column survives into the
+  reduced CREATE TABLE even when nothing in the surviving predicate
+  mentions it. Cheap to add and it would make reports shorter; left out
+  because dropping a column changes the DDL rather than the data, and
+  every oracle here assumes the schema is fixed for the life of a case.
