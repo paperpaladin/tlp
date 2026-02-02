@@ -15,6 +15,7 @@ tlp.py agg     [--n N] [--seed S]    aggregate partitioning
 tlp.py join    [--n N] [--seed S]    partition a join's ON clause
 tlp.py distinct [--n N] [--seed S]   partition a DISTINCT
 tlp.py group   [--n N] [--seed S]    partition a GROUP BY
+tlp.py having  [--n N] [--seed S]    partition a HAVING clause
 tlp.py selftest                      plant bugs, check the oracles notice
 tlp.py joinselftest                  the same, for the join relations
 tlp.py reduce  [--bug K]             shrink a found case to a minimal one
@@ -313,12 +314,72 @@ foreign keys, no virtual tables, no window functions.
             rather than SQL, the same defect the reducer had. Both now use
             sql_literal.
 
-- [ ] 10 HAVING partitioning
+- [x] 10 HAVING partitioning
       why: HAVING is where the grouped equivalent of a pushed-down
            predicate goes wrong, and item 09 deliberately left it out.
            The relation is not the obvious one: a HAVING clause filters
-           GROUPS, so partitioning it does not partition rows at all, and
-           the three arms have to be recombined on the group key.
+           GROUPS, so partitioning it does not partition rows at all.
+      done: and the recombination turned out to be the SIMPLEST here, in
+            the exact place item 09 needed the most care. Plain UNION ALL,
+            no re-aggregation: the groups are formed by the GROUP BY before
+            HAVING runs, so each one arrives whole in exactly one arm,
+            already counted. Item 09 needed SUM(n) because partitioning a
+            WHERE cuts every group into three pieces; partitioning a
+            HAVING cuts no group at all.
+      proves: what is load-bearing MOVES. For DISTINCT and GROUP BY the
+            composition operator was the trap; here it is not a trap and
+            the traps are all in the arms, in 200 checks:
+              as shipped                        0
+              UNION instead of UNION ALL        0   <- equivalent rewrite
+              drop the IS NULL arm             88
+              IS NOT TRUE beside an IS NULL arm 88
+              a duplicated TRUE arm           136
+            UNION costs nothing because each arm emits at most one row per
+            group key and the key is unique within a group, so the
+            recombined query never holds two identical rows. The one place
+            in this project where the obvious-looking mistake is not one,
+            and recorded rather than quietly relied on.
+      proves: having-drop-group is caught 98% by this relation and 0% by
+            the five others. Nothing else writes a HAVING clause.
+      found: THE THREE-WAY SPLIT IS A CHOICE, NOT A CORRECTNESS
+            REQUIREMENT, which changed what I thought this project was
+            doing. `h IS NOT TRUE` is exactly FALSE-or-NULL, so two arms
+            already cover every group once, and the two-arm split raises 0
+            false alarms in 200. It is not a quirk of HAVING either: the
+            same two-arm split holds for the row-level relation this
+            project is NAMED after, checked directly over 200 queries.
+            "Ternary" describes how the technique is usually written, not
+            something it needs to be valid.
+      found: and the obvious follow-up claim -- that three arms is at
+            least the STRONGER test, since it issues a third query shape --
+            is not supported by anything measured here. Three arms and two
+            arms detect drop-row, duplicate-row, null-only and
+            setop-drop-row at identical rates.
+            That is a finding about the PLANTED BUGS, not the relations.
+            They corrupt result sets rather than query plans, so they
+            cannot tell two sound relations apart however differently a
+            real engine would execute them. It is the ceiling of this whole
+            selftest approach and now says so in the README, because the
+            planted-bug table is the first thing in that file and would
+            otherwise read as measuring more than it does.
+      found: the vacuity is structurally capped, not merely low. The
+            generator reaches 18% three-valued against the row level's 32%,
+            and an eight-row table has about 3.9 groups -- splitting four
+            things three ways without emptying an arm is harder than
+            splitting eight. Measured rather than excused.
+            The aggregate mix is the lever: SUM, MIN and MAX go NULL on an
+            all-NULL group while the COUNTs never do, so a COUNT-only
+            generator leaves the third arm permanently empty (0%). 10%
+            COUNT terms at NULL rate 0.40 is the measured optimum, and the
+            sweep has the same interior peak as the row-level NULL rate for
+            the same reason. `having` is the one command whose NULL-rate
+            default is not 0.25.
+      found: a self-comparing test of mine, caught by mutation. The check
+            that the shipped arms are the correct ones compared
+            having_check.__defaults__ against tlp.HAVING_ARMS -- the
+            constant under test -- so it passed for any value that constant
+            held. Cutting the shipped arms to a two-way split left it
+            green. The literal tuple is now written out.
 - [ ] 11 a third table in the join, so reordering is actually exercised
       why: item 07 joins exactly two tables, which gives the planner
            almost no freedom to reorder -- and reordering is where it has

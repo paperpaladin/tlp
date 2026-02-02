@@ -263,14 +263,22 @@ def subtrees(node):
     return out
 
 
-def gen_tree(rnd, cols, depth=2):
+def gen_tree(rnd, cols, depth=2, atom=None):
+    """A predicate tree. `atom` defaults to the row-level atom generator.
+
+    Parameterised so HAVING predicates -- which are built from aggregates
+    rather than from columns -- get the same AND/OR/NOT structure, and
+    therefore the same reducer, for free.
+    """
+    atom = atom or gen_atom
     if depth <= 0 or rnd.random() < 0.3:
-        return ("atom", gen_atom(rnd, cols))
+        return ("atom", atom(rnd, cols))
     k = rnd.random()
     if k < 0.20:
-        return ("not", gen_tree(rnd, cols, depth - 1))
+        return ("not", gen_tree(rnd, cols, depth - 1, atom))
     return ("and" if k < 0.60 else "or",
-            gen_tree(rnd, cols, depth - 1), gen_tree(rnd, cols, depth - 1))
+            gen_tree(rnd, cols, depth - 1, atom),
+            gen_tree(rnd, cols, depth - 1, atom))
 
 
 def gen_predicate(rnd, cols, depth=2):
@@ -839,6 +847,147 @@ def cmd_agg(args):
     return 1 if found else 0
 
 
+# --------------------------------------------------------------- HAVING
+#
+# HAVING is the one that does not partition rows at all, which is why it
+# gets its own relation rather than a flag on the GROUP BY one.
+#
+# A WHERE predicate decides which ROWS survive. An ON predicate decides
+# which PAIRS exist. A HAVING predicate decides which GROUPS survive -- and
+# the groups are formed by the GROUP BY, before HAVING ever runs. So every
+# group makes the HAVING predicate exactly one of TRUE, FALSE or NULL, and
+# partitioning it splits the groups three ways while leaving every group
+# itself untouched.
+#
+# That makes the recombination the SIMPLEST one here, not the hardest, and
+# in the exact place where item 09 needed the most care:
+#
+#     SELECT g, COUNT(*) FROM t GROUP BY g HAVING h
+#       UNION ALL SELECT g, COUNT(*) FROM t GROUP BY g HAVING NOT h
+#       UNION ALL SELECT g, COUNT(*) FROM t GROUP BY g HAVING h IS NULL
+#     ==  SELECT g, COUNT(*) FROM t GROUP BY g
+#
+# Plain UNION ALL, and no re-aggregation. The GROUP BY relation needed
+# SUM(n) over the arms because partitioning a WHERE clause cuts every group
+# into three pieces that have to be added back together. Partitioning a
+# HAVING clause cuts no group at all: each one arrives whole in exactly one
+# arm, already counted. Same table, same three-way split, and the right
+# rule is different again because what is being split is different.
+#
+# The subtlety is in the generator instead. A HAVING predicate is built
+# from aggregates, and an aggregate is NULL in ways a column is not: SUM,
+# MIN and MAX of a group whose values are all NULL are NULL, while
+# COUNT(*) never is and COUNT(c) never is. So the third arm has substance
+# only if the generated predicates reach for the aggregates that can be
+# NULL, which is measured rather than assumed.
+
+# How often a HAVING atom is built from a COUNT rather than from SUM, MIN
+# or MAX. It matters because the two kinds differ in exactly the way the
+# third partition depends on: SUM, MIN and MAX of a group whose values are
+# all NULL are NULL, while COUNT(*) and COUNT(c) never are. A generator
+# made only of COUNTs leaves the NULL arm permanently empty; one with no
+# COUNTs at all loses every predicate that is reliably two-valued, and the
+# TRUE and FALSE arms thin out instead.
+#
+# 0.10 is measured, not chosen. The sweep is in the README, and it has an
+# interior optimum in both parameters for the same reason the row-level
+# NULL rate does.
+P_COUNT_TERM = 0.10
+
+
+def gen_having_atom(rnd, cols):
+    """One comparison between aggregates, or an aggregate against a literal."""
+    ints = [c for c, ty in cols if ty == "INTEGER"]
+    if not ints or rnd.random() < P_COUNT_TERM:
+        term = "COUNT(*)" if not ints or rnd.random() < 0.6 \
+            else "COUNT(%s)" % rnd.choice(ints)
+    else:
+        c = rnd.choice(ints)
+        term = rnd.choice(["SUM(%s)" % c, "MIN(%s)" % c, "MAX(%s)" % c])
+    k = rnd.random()
+    if k < 0.15:
+        return "%s IS NULL" % term
+    if k < 0.22:
+        return "%s IS NOT NULL" % term
+    return "%s %s %s" % (term, rnd.choice(CMP), rnd.choice(INTS))
+
+
+def gen_having(rnd, cols, depth=2):
+    return render(gen_tree(rnd, cols, depth, gen_having_atom))
+
+
+def having_group_sizes(db, pred, col):
+    """How many GROUPS land in each of the three HAVING partitions."""
+    n = lambda h: db.execute(
+        "SELECT COUNT(*) FROM (SELECT %s FROM t GROUP BY %s HAVING %s)"
+        % (col, col, h)).fetchone()[0]
+    return (n("(%s)" % pred), n("NOT (%s)" % pred), n("(%s) IS NULL" % pred))
+
+
+HAVING_ARMS = ("(%s)", "NOT (%s)", "(%s) IS NULL")
+
+
+def having_check(db, pred, col, combine="UNION ALL", arms=HAVING_ARMS):
+    """The grouped whole against the same groups split three ways.
+
+    `combine` and `arms` are parameters so the suite can put the wrong rule
+    in and watch the relation go wrong. Their defaults are what ships, and
+    the suite checks the defaults separately -- a parameterised test that
+    always supplies the parameter stops testing what ships.
+    """
+    whole = rows_of(db, "SELECT %s, COUNT(*) FROM t GROUP BY %s" % (col, col))
+    parts = rows_of(db,
+                    (" %s " % combine).join(
+                        "SELECT %s, COUNT(*) FROM t GROUP BY %s HAVING %s"
+                        % (col, col, arm % pred) for arm in arms))
+    if whole == parts:
+        return None
+    return ("HAVING", len(whole), len(parts))
+
+
+def cmd_having(args):
+    """Its own driver, because the vacuity question is about GROUPS here.
+
+    run_oracle reports how often a predicate splits the ROWS three ways,
+    which is the wrong measurement for a clause that never looks at a row.
+    """
+    import random
+    rnd = random.Random(args.seed)
+    db = sqlite3.connect(":memory:")
+    found = tested = skipped = interesting = 0
+
+    for i in range(args.n):
+        ddl, cols, rows = build(db, rnd, args.rows, args.null_rate)
+        col = cols[0][0]
+        pred = gen_having(rnd, cols, args.depth)
+        try:
+            t, f, u = having_group_sizes(db, pred, col)
+            bad = having_check(db, pred, col)
+        except sqlite3.Error:
+            skipped += 1
+            continue
+        tested += 1
+        if t and f and u:
+            interesting += 1
+        if bad:
+            found += 1
+            print("FOUND  HAVING disagreement on seed step %d" % i)
+            print("  %s" % ddl)
+            for r in rows:
+                print("  INSERT INTO t VALUES (%s);"
+                      % ", ".join(sql_literal(v) for v in r))
+            print("  GROUP BY %s HAVING %s" % (col, pred))
+            print("  whole %r groups, recombined %r" % (bad[1], bad[2]))
+            if found >= args.max_reports:
+                break
+
+    print("HAVING: %d queries, %d disagreements, %d skipped, "
+          "%d split the groups three ways (%.0f%%)"
+          % (tested, found, skipped, interesting,
+             100.0 * interesting / tested if tested else 0.0))
+    return 1 if found else 0
+
+
 # --------------------------------------------- DISTINCT and GROUP BY
 #
 # Both are the partitioning done over a query shape where the obvious
@@ -1037,6 +1186,16 @@ class Corrupt:
         if k == "distinct-dup" and sql.startswith("SELECT DISTINCT") \
                 and "UNION" not in sql and rows:
             return rows + rows[:1]
+        # A group wrongly excluded by a HAVING filter. Only the HAVING
+        # relation ever issues a HAVING clause, so only it can see this.
+        #
+        # This corrupts the RECOMBINED side rather than the whole, which is
+        # the opposite of the other planted bugs and is correct here: the
+        # whole query of that relation has no HAVING in it at all. The
+        # defect being modelled is a group wrongly filtered out, and the
+        # HAVING'd query is where that happens.
+        if k == "having-drop-group" and "HAVING" in sql and len(rows) > 2:
+            return rows[:-1]
         # One group counted one row too many. Invisible to everything that
         # does not group: the rows all reassemble, the whole-table count is
         # right, and the whole-table aggregate is right.
@@ -1048,7 +1207,7 @@ class Corrupt:
 
 BUG_KINDS = ["drop-row", "duplicate-row", "null-only", "count-off-by-one",
              "aggregate-skew", "distinct-dup", "group-skew",
-             "setop-drop-row"]
+             "setop-drop-row", "having-drop-group"]
 
 
 JOIN_BUG_KINDS = ["join-drop-pair", "leftjoin-overpad"]
@@ -1096,11 +1255,13 @@ def cmd_selftest(args):
     import random
     real = sqlite3.connect(":memory:")
 
-    print("%-20s %8s %8s %8s %9s %8s"
-          % ("planted bug", "TLP", "NoREC", "agg", "DISTINCT", "GROUP"))
+    print("%-18s %6s %6s %6s %9s %6s %7s"
+          % ("planted bug", "TLP", "NoREC", "agg", "DISTINCT", "GROUP",
+             "HAVING"))
     worst = {}
     for kind in BUG_KINDS:
-        hits = {"TLP": 0, "NoREC": 0, "agg": 0, "DISTINCT": 0, "GROUP": 0}
+        hits = dict.fromkeys(("TLP", "NoREC", "agg", "DISTINCT", "GROUP",
+                              "HAVING"), 0)
         rnd = random.Random(args.seed)
         for _ in range(args.n):
             _, cols, _ = build(real, rnd, args.rows, args.null_rate)
@@ -1126,13 +1287,23 @@ def cmd_selftest(args):
                         hits[name] += 1
                 except sqlite3.Error:
                     pass
-        print("%-20s %7d%% %7d%% %7d%% %8d%% %7d%%"
+            # HAVING needs its own predicate: a row-level one is not legal
+            # in a HAVING clause, and feeding it one would skip every check
+            # with an sqlite3.Error and print a column of zeros.
+            try:
+                if having_check(bent, gen_having(rnd, cols, args.depth),
+                                cols[0][0]):
+                    hits["HAVING"] += 1
+            except sqlite3.Error:
+                pass
+        print("%-18s %5d%% %5d%% %5d%% %8d%% %5d%% %6d%%"
               % (kind,
                  100 * hits["TLP"] // args.n,
                  100 * hits["NoREC"] // args.n,
                  100 * hits["agg"] // args.n,
                  100 * hits["DISTINCT"] // args.n,
-                 100 * hits["GROUP"] // args.n))
+                 100 * hits["GROUP"] // args.n,
+                 100 * hits["HAVING"] // args.n))
         worst[kind] = max(hits.values())
 
     missed = [k for k, v in worst.items() if v == 0]
@@ -1197,6 +1368,19 @@ def main():
     p.add_argument("--depth", type=int, default=3)
     p.add_argument("--null-rate", type=float, default=0.25, dest="null_rate")
     p.set_defaults(fn=cmd_reduce)
+
+    p = sub.add_parser("having", help="partition a HAVING clause")
+    p.add_argument("--n", type=int, default=400)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--rows", type=int, default=8)
+    p.add_argument("--depth", type=int, default=2)
+    # 0.40, not the 0.25 every other command uses, and measured rather than
+    # inherited. A HAVING partition splits GROUPS, and a group goes NULL
+    # only when every value in it is NULL, which needs more NULLs than
+    # making a single row's predicate go NULL does.
+    p.add_argument("--null-rate", type=float, default=0.40, dest="null_rate")
+    p.add_argument("--max-reports", type=int, default=3, dest="max_reports")
+    p.set_defaults(fn=cmd_having)
 
     p = sub.add_parser("join", help="partition a join's ON clause")
     p.add_argument("--n", type=int, default=400)
