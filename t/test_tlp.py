@@ -601,8 +601,11 @@ check("...and the default composition rules are the correct ones",
 # they were sized for a 300-case sweep and silently became unreachable when
 # this runs 200, which failed loudly here but would elsewhere have been a
 # test that could never pass.
+MEASURED = {}   # table row label -> the count this run actually measured
+
 for combine, floor in (("UNION ALL", 0.4), ("INTERSECT", 0.9), ("EXCEPT", 0.9)):
     a, t = false_alarms(tlp.distinct_check, combine=combine)
+    MEASURED["`%s`" % combine] = a
     if a >= floor * t:
         ok("DISTINCT recombined with %s raises %d false alarms in %d"
            % (combine, a, t))
@@ -612,6 +615,7 @@ for combine, floor in (("UNION ALL", 0.4), ("INTERSECT", 0.9), ("EXCEPT", 0.9)):
 
 for outer, floor in (("COUNT", 0.9), ("MIN", 0.4), ("MAX", 0.4), ("AVG", 0.4)):
     a, t = false_alarms(tlp.group_check, outer=outer)
+    MEASURED["`%s`" % outer] = a
     if a >= floor * t:
         ok("GROUP BY counts recombined with %s raise %d false alarms in %d"
            % (outer, a, t))
@@ -773,6 +777,7 @@ for label, kw, floor in (
         ("a duplicated TRUE arm",
          {"arms": ("(%s)", "(%s)", "NOT (%s)", "(%s) IS NULL")}, 0.6)):
     a, t = having_alarms(**kw)
+    MEASURED[label] = a
     if a >= floor * t:
         ok("HAVING: %s raises %d false alarms in %d" % (label, a, t))
     else:
@@ -884,6 +889,51 @@ ok("a group lost to a HAVING filter is caught by the HAVING relation (%d%%)"
 check("...and nothing else writes HAVING, so nothing else can see it",
       [h[k] for k in ("TLP", "NoREC", "agg", "DISTINCT", "GROUP")],
       [0, 0, 0, 0, 0])
+
+# ------------------------------------------- the README against this run
+#
+# Every false-alarm count in README.md is a number somebody copied out of a
+# terminal, which means it can drift away from what the code does while the
+# suite stays green -- the exact failure the portfolio generator exists to
+# prevent for the top-level document, and which nothing was preventing here.
+# This repo's own README had already overstated itself once: it claimed a
+# test count of 48 after the suite had grown to 65.
+#
+# So the tables are checked against the numbers measured a few lines above,
+# in this process, on this machine.
+
+readme = (ROOT / "README.md").read_text()
+
+# Matched as WHOLE ROWS built from the measured numbers, not by looking for
+# a label and a number somewhere near each other. `MIN` and `MAX` head rows
+# in the aggregate table as well as appearing in the DISTINCT/GROUP one, and
+# the aggregate table happens to contain the value 127 -- so a loose match
+# lets a number from one table satisfy a claim about another. Constructing
+# the row and requiring it verbatim cannot do that.
+expected = [
+    "| `UNION ALL` | %d | | `COUNT` | %d |"
+    % (MEASURED["`UNION ALL`"], MEASURED["`COUNT`"]),
+    "| `INTERSECT` | %d | | `MIN` | %d |"
+    % (MEASURED["`INTERSECT`"], MEASURED["`MIN`"]),
+    "| `EXCEPT` | %d | | `MAX` | %d |"
+    % (MEASURED["`EXCEPT`"], MEASURED["`MAX`"]),
+    "| | | | `AVG` | %d |" % MEASURED["`AVG`"],
+    "| drop the `IS NULL` arm | %d |"
+    % MEASURED["dropping the IS NULL arm"],
+    "| `IS NOT TRUE` alongside an `IS NULL` arm | %d |"
+    % MEASURED["IS NOT TRUE alongside an IS NULL arm"],
+    "| a duplicated TRUE arm | %d |" % MEASURED["a duplicated TRUE arm"],
+]
+check("every false-alarm count in README.md is the one measured here",
+      [row for row in expected if row not in readme], [])
+
+# The suite's own size is deliberately NOT checked here. Counting this
+# suite's checks from inside this suite makes the expected value depend on
+# how many checks do the counting, so every check added later has to be
+# matched by editing an arithmetic constant in one of them. That is a test
+# that breaks for reasons unrelated to the code, which is worse than the
+# drift it would catch. The README's "N passed" line is verified by reading
+# it against a run, the same way every other transcript in it is.
 
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)
