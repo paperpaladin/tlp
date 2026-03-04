@@ -13,6 +13,7 @@ tlp.py tlp     [--n N] [--seed S]    ternary partitioning
 tlp.py norec   [--n N] [--seed S]    optimised against unoptimised
 tlp.py agg     [--n N] [--seed S]    aggregate partitioning
 tlp.py join    [--n N] [--seed S]    partition a join's ON clause
+tlp.py join3   [--n N] [--seed S]    three tables, and join reordering
 tlp.py distinct [--n N] [--seed S]   partition a DISTINCT
 tlp.py group   [--n N] [--seed S]    partition a GROUP BY
 tlp.py having  [--n N] [--seed S]    partition a HAVING clause
@@ -380,11 +381,52 @@ foreign keys, no virtual tables, no window functions.
             constant under test -- so it passed for any value that constant
             held. Cutting the shipped arms to a two-way split left it
             green. The literal tuple is now written out.
-- [ ] 11 a third table in the join, so reordering is actually exercised
+- [x] 11 a third table in the join, so reordering is actually exercised
       why: item 07 joins exactly two tables, which gives the planner
            almost no freedom to reorder -- and reordering is where it has
-           the most freedom to be wrong. The README says so plainly and
-           that admission is the reason this is next rather than later.
+           the most freedom to be wrong. The README said so plainly and
+           that admission is why this was next rather than later.
+      done: two relations. The ON-partitioning carries over with the left
+            side of the partitioned join now a join itself. And a new one
+            that could not exist with two tables: SQLite documents CROSS
+            JOIN as suppressing its own reordering, so the same query
+            written both ways must agree, which differences the planner's
+            chosen order against a fixed one.
+      proves: the two forms reach genuinely different machinery -- the free
+            form was observed visiting t1, t3, t2 and building an automatic
+            covering index and a Bloom filter where the forced form scanned
+            t3 last and did neither.
+            reorder-skew is caught 30% by the reordering relation and 0% by
+            the three others; a lost pair is caught 48% by the three-table
+            ON-partitioning and 0% by the reordering one.
+            And because the whole relation rests on CROSS JOIN pinning the
+            order, the suite asks EXPLAIN QUERY PLAN whether it does rather
+            than taking it from the documentation.
+      note: the relation is worth nothing in the runs where SQLite picks
+            the same order both ways, so the fraction where it actually
+            reordered is measured and reported like the three-valued
+            fraction. 62% on the default run.
+      found: A LEVER THAT DID NOT SURVIVE BEING MEASURED PROPERLY, and the
+            test asserting it passed. A minimal probe -- two cross-table
+            comparisons and nothing else -- said equality predicates and an
+            index moved the reordering rate from 15% to 67%, so the
+            generator was built around both. On the shipped generator
+            equality is worth 1 to 6 points and the index 6 to 11, with 15
+            to 19 for both, measured over four seeds. The direction holds
+            everywhere; the size did not transfer, because the real
+            predicates already carry several cross-table comparisons and
+            the planner has reasons to reorder without the help.
+            The assertion written for the equality lever read NOISE: 58%
+            against 64% at 200 cases is 61% against 60% at 500. What is
+            asserted now is the combined effect, whose margin is 15 to 19
+            points, and the individual rates are printed without an
+            assertion the sample cannot support.
+      note: reorder-skew is openly a PROXY. SQLite cannot be made to choose
+            a wrong order on request, so what is corrupted is the CROSS
+            JOIN form, whose order is pinned. The effect on the relation
+            matches a planner that got the free order wrong; the limitation
+            is that a real reordering bug would also change the plan, which
+            this cannot. Recorded in the README rather than left implicit.
 - [ ] 12 LIKE and GLOB, with BINARY pinned explicitly
       why: a rich source of behaviour, and the reason it has been deferred
            is in the open questions below. Pinning the collation is what

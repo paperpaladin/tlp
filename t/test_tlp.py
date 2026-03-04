@@ -935,5 +935,186 @@ check("every false-alarm count in README.md is the one measured here",
 # drift it would catch. The README's "N passed" line is verified by reading
 # it against a run, the same way every other transcript in it is.
 
+# --------------------------------------- three tables, and join reordering
+#
+# Two tables give a planner one join and two orders. Three give it a real
+# choice, and reordering is where it has the most room to be wrong.
+#
+# The reordering relation rests entirely on one documented SQLite
+# behaviour: CROSS JOIN suppresses reordering, so the tables are visited in
+# the order written. If that were not true the relation would be comparing
+# a query against itself, so it is checked directly rather than taken from
+# the documentation.
+
+def plan_tables(db, sql):
+    """The order EXPLAIN QUERY PLAN says the tables are visited in."""
+    order = []
+    for row in db.execute("EXPLAIN QUERY PLAN " + sql):
+        for word in row[3].split():
+            if word in ("t1", "t2", "t3") and word not in order:
+                order.append(word)
+    return order
+
+
+rnd = random.Random(0)
+db = sqlite3.connect(":memory:")
+forced_wrong = free_differs = tested = 0
+for _ in range(150):
+    specs = tlp.build3(db, rnd, 6, 0.25)
+    pred = tlp.gen_join3_predicate(rnd, specs, 2)
+    try:
+        forced = plan_tables(
+            db, "SELECT * FROM t1 CROSS JOIN t2 CROSS JOIN t3 WHERE %s" % pred)
+        free = plan_tables(
+            db, "SELECT * FROM t1 JOIN t2 JOIN t3 WHERE %s" % pred)
+    except sqlite3.Error:
+        continue
+    tested += 1
+    if forced != ["t1", "t2", "t3"]:
+        forced_wrong += 1
+    free_differs += (free != forced)
+check("CROSS JOIN pins the join order to the order written", forced_wrong, 0)
+pct = free_differs * 100 // tested
+ok("...and the planner picks a different order %d%% of the time, so the "
+   "relation is not comparing a query to itself" % pct) if pct >= 25 else \
+    no("the planner almost never reorders, so the relation is near-vacuous",
+       "%d%%" % pct)
+
+
+def join3_alarms(fn, n=150, seed=0, **kw):
+    """False alarms from a three-table relation against a correct engine."""
+    rnd = random.Random(seed)
+    db = sqlite3.connect(":memory:")
+    a = t = 0
+    for _ in range(n):
+        specs = tlp.build3(db, rnd, 6, 0.25, **kw)
+        pred = tlp.gen_join3_predicate(rnd, specs, 2)
+        p12 = "%s.%s = %s.%s" % (specs[0][0], specs[0][1][0][0],
+                                 specs[1][0], specs[1][1][0][0])
+        try:
+            bad = fn(db, pred, p12)
+        except sqlite3.Error:
+            continue
+        t += 1
+        a += bool(bad)
+    return a, t
+
+check("ON-partitioning over a join raises no false alarm",
+      join3_alarms(lambda db, p, p12: tlp.join3_check(db, p, p12))[0], 0)
+check("the reordering relation raises no false alarm",
+      join3_alarms(lambda db, p, p12: tlp.reorder_check(db, p))[0], 0)
+
+# Every table has to appear, or the third one only multiplies the row count
+# and this is a two-table join with a spectator.
+rnd = random.Random(4)
+db = sqlite3.connect(":memory:")
+allthree = 0
+for _ in range(200):
+    specs = tlp.build3(db, rnd, 6, 0.25)
+    pred = tlp.gen_join3_predicate(rnd, specs, 2)
+    allthree += all(("%s." % n) in pred for n, _, _ in specs)
+check("every generated predicate mentions all three tables", allthree, 200)
+
+# How much the generator's two choices -- biasing cross-comparisons toward
+# "=" and indexing the first column -- actually affect how often the
+# planner reorders.
+#
+# The first version of this asserted that turning off the equality bias
+# measurably lowered the rate, and it PASSED: 58% against 64% at 200 cases.
+# At 500 it is 61% against 60%. The assertion was reading noise, and it was
+# reading noise about a claim imported from a minimal probe -- two cross
+# comparisons and nothing else -- where the two levers really were worth
+# 15% against 67%. On the shipped generator they are worth single digits,
+# because the generated predicates already carry several cross-table
+# comparisons and the planner has reasons to reorder without the help.
+#
+# So what is asserted now is the COMBINED effect, whose margin is 15 to 19
+# points over four seeds, and the individual rates are printed without an
+# assertion that the sample cannot support.
+
+def reorder_rate(n=200, seed=0, eq=None, index=True):
+    rnd = random.Random(seed)
+    db = sqlite3.connect(":memory:")
+    saved = tlp.P_JOIN_EQ
+    if eq is not None:
+        tlp.P_JOIN_EQ = eq
+    try:
+        moved = t = 0
+        for _ in range(n):
+            specs = tlp.build3(db, rnd, 6, 0.25, index=index)
+            pred = tlp.gen_join3_predicate(rnd, specs, 2)
+            try:
+                moved += tlp.plans_differ(db, pred)
+            except sqlite3.Error:
+                continue
+            t += 1
+        return moved * 100 // t
+    finally:
+        tlp.P_JOIN_EQ = saved
+
+shipped = reorder_rate(n=400)
+no_eq = reorder_rate(n=400, eq=0.0)
+no_idx = reorder_rate(n=400, index=False)
+neither = reorder_rate(n=400, eq=0.0, index=False)
+ok("as shipped the planner reorders %d%% of the time" % shipped) \
+    if shipped >= 40 else no("the shipped generator barely reorders",
+                             "%d%%" % shipped)
+ok("...dropping both the equality bias and the index takes it to %d%%"
+   % neither) if neither <= shipped - 8 else \
+    no("neither generator choice affects how often the planner reorders",
+       "%d%% vs %d%% shipped" % (neither, shipped))
+ok("...the index alone is worth %d points (%d%% without it)"
+   % (shipped - no_idx, no_idx)) if no_idx < shipped else \
+    no("the index does not affect how often the planner reorders",
+       "%d%% vs %d%%" % (no_idx, shipped))
+# Recorded, NOT asserted: 1 to 6 points across the seeds tried is inside
+# what 400 cases can tell apart, and an assertion here would be a test that
+# fails on a seed change rather than on a code change.
+ok("...the equality bias is worth %d points (%d%% without it), too small "
+   "at this sample size to assert" % (shipped - no_eq, no_eq))
+
+
+def join_detection(kind, n=120, seed=0):
+    """Which of the four join relations notices a planted bug."""
+    rnd = random.Random(seed)
+    real = sqlite3.connect(":memory:")
+    hits = dict.fromkeys(("inner", "left", "join3", "reorder"), 0)
+    for _ in range(n):
+        specs = tlp.build3(real, rnd, 6, 0.25)
+        t1, t2, _ = specs
+        pred2 = tlp.gen_join_predicate(rnd, t1, t2, 2)
+        pred3 = tlp.gen_join3_predicate(rnd, specs, 2)
+        p12 = "%s.%s = %s.%s" % (t1[0], t1[1][0][0], t2[0], t2[1][0][0])
+        bent = tlp.Corrupt(real, kind)
+        probes = (("inner", lambda: tlp.join_check(bent, pred2)),
+                  ("left", lambda: tlp.leftjoin_check(bent, pred2)),
+                  ("join3", lambda: tlp.join3_check(bent, pred3, p12)),
+                  ("reorder", lambda: tlp.reorder_check(bent, pred3)))
+        for name, fn in probes:
+            try:
+                hits[name] += bool(fn())
+            except sqlite3.Error:
+                pass
+    return {k: v * 100 // n for k, v in hits.items()}
+
+
+# One join order returning different rows from another. Nothing else here
+# writes a CROSS JOIN, so nothing else can see it.
+r = join_detection("reorder-skew")
+ok("a disagreement between join orders is caught by the reordering relation "
+   "(%d%%)" % r["reorder"]) if r["reorder"] > 15 else \
+    no("a disagreement between join orders is not caught", repr(r))
+check("...and no other join relation pins an order, so none can see it",
+      [r[k] for k in ("inner", "left", "join3")], [0, 0, 0])
+
+# And the ON-partitioning still works when its left side is itself a join,
+# which is the shape where the planner has a choice to make.
+d = join_detection("join-drop-pair")
+ok("a lost pair is caught over a three-table join too (%d%%)" % d["join3"]) \
+    if d["join3"] > 20 else \
+    no("the three-table ON-partitioning cannot see a lost pair", repr(d))
+check("...and the reordering relation never partitions, so it cannot",
+      d["reorder"], 0)
+
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)
