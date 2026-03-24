@@ -199,6 +199,38 @@ def build(db, rnd, nrows=8, null_rate=0.25):
 
 CMP = ["=", "<>", "<", "<=", ">", ">="]
 
+# LIKE and GLOB are both pattern matchers, and the relation between them
+# below only holds with LIKE's case folding turned off. More to the point,
+# LIKE's default is ASCII-case-INSENSITIVE while GLOB is case-sensitive, so
+# leaving the pragma alone would make every comparison between them
+# disagree on the first capital letter. Pinned here rather than at each
+# call site, because a connection that forgot it would not fail loudly --
+# it would quietly measure something else.
+PRAGMAS = ("case_sensitive_like=ON",)
+
+
+def connect():
+    """An in-memory database with this project's semantics pinned."""
+    db = sqlite3.connect(":memory:")
+    for pragma in PRAGMAS:
+        db.execute("PRAGMA %s" % pragma)
+    return db
+
+
+# A LIKE pattern is built only from these, and the restriction is
+# load-bearing rather than tidiness. The relation below rewrites a LIKE
+# pattern into a GLOB one by % -> * and _ -> ?, which is wrong the moment
+# the pattern already contains a GLOB metacharacter:
+#
+#   'axb' LIKE 'a*b'   is FALSE   -- * is a literal to LIKE
+#   'axb' GLOB 'a*b'   is TRUE    -- * is a wildcard to GLOB
+#
+# and the same for ?, and for [ which opens a character class in GLOB and
+# is a literal in LIKE. So *, ?, [ and ] never appear in a generated
+# pattern, and neither does the backslash, because LIKE takes an ESCAPE
+# clause and GLOB has none.
+PAT_CHARS = ["a", "b", "c", "%", "_"]
+
 
 def gen_atom(rnd, cols):
     name, ty = rnd.choice(cols)
@@ -220,7 +252,33 @@ def gen_atom(rnd, cols):
     if k < 0.55 and len(cols) > 1:
         other, oty = rnd.choice(cols)
         return "%s %s %s" % (name, rnd.choice(CMP), other)
+    # Pattern matching, on a TEXT column where it means something. On an
+    # INTEGER column SQLite coerces the value to text and the predicate
+    # still works, but it stops being about pattern matching.
+    if k < 0.68:
+        text = [c for c, t in cols if t == "TEXT"]
+        if text:
+            op = "LIKE" if rnd.random() < 0.6 else "GLOB"
+            pat = gen_pattern(rnd, op)
+            return "%s %s '%s'" % (rnd.choice(text), op, pat)
     return "%s %s %s" % (name, rnd.choice(CMP), lit(rnd, ty))
+
+
+def gen_pattern(rnd, op="LIKE"):
+    """A pattern from the restricted alphabet, in the right dialect."""
+    pat = "".join(rnd.choice(PAT_CHARS) for _ in range(rnd.randint(1, 4)))
+    return like_to_glob(pat) if op == "GLOB" else pat
+
+
+def like_to_glob(pat):
+    """The same pattern in GLOB's dialect.
+
+    Sound only for patterns over PAT_CHARS -- see the note there. A pattern
+    carrying a *, ? or [ would have those read as metacharacters by GLOB
+    and as literals by LIKE, and the rewrite would change what is matched.
+    """
+    assert not set(pat) & set("*?[]\\"), "pattern is not translatable"
+    return pat.replace("%", "*").replace("_", "?")
 
 
 def lit(rnd, ty):
@@ -307,7 +365,7 @@ def partition_sizes(db, pred):
 def cmd_vacuity(args):
     import random
     rnd = random.Random(args.seed)
-    db = sqlite3.connect(":memory:")
+    db = connect()
 
     three = 0      # all three partitions non-empty
     has_null = 0   # the NULL arm is non-empty
@@ -393,7 +451,7 @@ def run_oracle(args, check, label):
     """Shared driver. Reports, and says what it did when it finds nothing."""
     import random
     rnd = random.Random(args.seed)
-    db = sqlite3.connect(":memory:")
+    db = connect()
 
     found = 0
     tested = 0
@@ -553,7 +611,7 @@ def cmd_reduce(args):
     """
     import random
     rnd = random.Random(args.seed)
-    db = sqlite3.connect(":memory:")
+    db = connect()
 
     for i in range(args.tries):
         _, cols, rows = build(db, rnd, args.rows, args.null_rate)
@@ -711,7 +769,7 @@ def leftjoin_check(db, pred):
 def cmd_join(args):
     import random
     rnd = random.Random(args.seed)
-    db = sqlite3.connect(":memory:")
+    db = connect()
     found = tested = skipped = interesting = 0
 
     for i in range(args.n):
@@ -806,7 +864,7 @@ def agg_check(db, pred, agg, col):
 def cmd_agg(args):
     import random
     rnd = random.Random(args.seed)
-    db = sqlite3.connect(":memory:")
+    db = connect()
     found = tested = skipped = 0
     per_agg = {a: 0 for a in AGGREGATES}
 
@@ -844,6 +902,90 @@ def cmd_agg(args):
           (tested, found, skipped))
     print("  per aggregate: %s" %
           ", ".join("%s %d" % (a, n) for a, n in sorted(per_agg.items())))
+    return 1 if found else 0
+
+
+# ----------------------------------------------- LIKE against GLOB
+#
+# The only place in this project with a DIFFERENTIAL oracle rather than a
+# metamorphic one, and it needs no second database: SQLite ships two
+# independent pattern matchers, and they can be pointed at each other.
+#
+# LIKE and GLOB are separate implementations with separate wildcard
+# syntax. Over the restricted alphabet in PAT_CHARS the two languages say
+# the same thing under % -> * and _ -> ?, so:
+#
+#     SELECT * FROM t WHERE c LIKE 'a%b'
+#     ==  SELECT * FROM t WHERE c GLOB 'a*b'
+#
+# must hold row for row, including for NULL, where both must yield NULL
+# rather than FALSE.
+#
+# Two preconditions, and both are enforced rather than hoped for. LIKE
+# folds ASCII case by default and GLOB never does, so the pragma is pinned
+# in connect(). And the rewrite is only valid over PAT_CHARS, which
+# like_to_glob() asserts rather than trusts -- a pattern containing a *, a
+# ? or a [ would be read as a metacharacter by one side and a literal by
+# the other.
+
+
+def like_glob_check(db, col, pat):
+    """The same pattern put to both of SQLite's matchers."""
+    like = rows_of(db, "SELECT * FROM t WHERE %s LIKE '%s'" % (col, pat))
+    glob = rows_of(db, "SELECT * FROM t WHERE %s GLOB '%s'"
+                   % (col, like_to_glob(pat)))
+    if like == glob:
+        return None
+    return ("LIKE/GLOB", len(like), len(glob))
+
+
+def cmd_like(args):
+    """LIKE against GLOB, and how often the pattern matched anything.
+
+    The vacuity question here is not three-valuedness. A pattern that
+    matches no row, or every row, makes the two matchers agree trivially,
+    so what is reported is how often the pattern actually split the table.
+    """
+    import random
+    rnd = random.Random(args.seed)
+    db = connect()
+    found = tested = skipped = split = 0
+
+    for i in range(args.n):
+        ddl, cols, rows = build(db, rnd, args.rows, args.null_rate)
+        text = [c for c, t in cols if t == "TEXT"]
+        if not text:
+            skipped += 1
+            continue
+        col = rnd.choice(text)
+        pat = gen_pattern(rnd)
+        try:
+            bad = like_glob_check(db, col, pat)
+            hit = db.execute("SELECT COUNT(*) FROM t WHERE %s LIKE '%s'"
+                             % (col, pat)).fetchone()[0]
+        except sqlite3.Error:
+            skipped += 1
+            continue
+        tested += 1
+        if 0 < hit < len(rows):
+            split += 1
+        if bad:
+            found += 1
+            print("FOUND  LIKE/GLOB disagreement on seed step %d" % i)
+            print("  %s" % ddl)
+            for r in rows:
+                print("  INSERT INTO t VALUES (%s);"
+                      % ", ".join(sql_literal(v) for v in r))
+            print("  %s LIKE '%s'  vs  %s GLOB '%s'"
+                  % (col, pat, col, like_to_glob(pat)))
+            print("  LIKE returns %d rows, GLOB returns %d" % (bad[1], bad[2]))
+            if found >= args.max_reports:
+                break
+
+    print("LIKE vs GLOB: %d queries, %d disagreements, %d skipped, "
+          "%d where the pattern split the table (%.0f%%)"
+          % (tested, found, skipped, split,
+             100.0 * split / tested if tested else 0.0))
     return 1 if found else 0
 
 
@@ -1026,7 +1168,7 @@ def cmd_join3(args):
     """
     import random
     rnd = random.Random(args.seed)
-    db = sqlite3.connect(":memory:")
+    db = connect()
     found = tested = skipped = reordered = 0
 
     for i in range(args.n):
@@ -1170,7 +1312,7 @@ def cmd_having(args):
     """
     import random
     rnd = random.Random(args.seed)
-    db = sqlite3.connect(":memory:")
+    db = connect()
     found = tested = skipped = interesting = 0
 
     for i in range(args.n):
@@ -1401,6 +1543,15 @@ class Corrupt:
         # was the bug that could not see the relation.
         if k == "setop-drop-row" and "UNION" in sql and len(rows) > 3:
             return rows[:-1]
+        # GLOB's matcher wrong where LIKE's is right. Narrowly aimed at a
+        # bare pattern-match query, because GLOB now appears in ordinary
+        # generated predicates too -- so "GLOB in sql" alone would fire
+        # inside TLP's own partition queries and the bug would look broader
+        # than it is. The whole side of every other relation either has no
+        # WHERE clause, counts, groups, or carries a UNION.
+        if k == "glob-skew" and sql.startswith("SELECT * FROM t WHERE") \
+                and " GLOB " in sql and "UNION" not in sql and len(rows) > 1:
+            return rows[:-1]
         # A DISTINCT that returns a value twice: a dedup step skipped on one
         # path. No other relation here ever writes DISTINCT, so no other
         # relation can see it.
@@ -1434,7 +1585,7 @@ class Corrupt:
 
 BUG_KINDS = ["drop-row", "duplicate-row", "null-only", "count-off-by-one",
              "aggregate-skew", "distinct-dup", "group-skew",
-             "setop-drop-row", "having-drop-group"]
+             "setop-drop-row", "having-drop-group", "glob-skew"]
 
 
 JOIN_BUG_KINDS = ["join-drop-pair", "leftjoin-overpad", "reorder-skew"]
@@ -1453,7 +1604,7 @@ def cmd_joinselftest(args):
     third -- so this table is a real comparison between them.
     """
     import random
-    real = sqlite3.connect(":memory:")
+    real = connect()
     print("%-20s %8s %10s %8s %9s"
           % ("planted bug", "INNER", "LEFT JOIN", "JOIN3", "REORDER"))
     missed = []
@@ -1494,15 +1645,15 @@ def cmd_joinselftest(args):
 
 def cmd_selftest(args):
     import random
-    real = sqlite3.connect(":memory:")
+    real = connect()
 
-    print("%-18s %6s %6s %6s %9s %6s %7s"
+    print("%-18s %6s %6s %5s %9s %6s %7s %6s"
           % ("planted bug", "TLP", "NoREC", "agg", "DISTINCT", "GROUP",
-             "HAVING"))
+             "HAVING", "LIKE"))
     worst = {}
     for kind in BUG_KINDS:
         hits = dict.fromkeys(("TLP", "NoREC", "agg", "DISTINCT", "GROUP",
-                              "HAVING"), 0)
+                              "HAVING", "LIKE"), 0)
         rnd = random.Random(args.seed)
         for _ in range(args.n):
             _, cols, _ = build(real, rnd, args.rows, args.null_rate)
@@ -1537,14 +1688,24 @@ def cmd_selftest(args):
                     hits["HAVING"] += 1
             except sqlite3.Error:
                 pass
-        print("%-18s %5d%% %5d%% %5d%% %8d%% %5d%% %6d%%"
+            # LIKE/GLOB needs a TEXT column and a pattern, not a predicate.
+            text = [c for c, t in cols if t == "TEXT"]
+            if text:
+                try:
+                    if like_glob_check(bent, rnd.choice(text),
+                                       gen_pattern(rnd)):
+                        hits["LIKE"] += 1
+                except sqlite3.Error:
+                    pass
+        print("%-18s %5d%% %5d%% %4d%% %8d%% %5d%% %6d%% %5d%%"
               % (kind,
                  100 * hits["TLP"] // args.n,
                  100 * hits["NoREC"] // args.n,
                  100 * hits["agg"] // args.n,
                  100 * hits["DISTINCT"] // args.n,
                  100 * hits["GROUP"] // args.n,
-                 100 * hits["HAVING"] // args.n))
+                 100 * hits["HAVING"] // args.n,
+                 100 * hits["LIKE"] // args.n))
         worst[kind] = max(hits.values())
 
     missed = [k for k, v in worst.items() if v == 0]
@@ -1556,7 +1717,7 @@ def cmd_selftest(args):
 
 
 def cmd_truth(args):
-    db = sqlite3.connect(":memory:")
+    db = connect()
     exprs = enumerate_exprs(args.depth)
     bad = 0
     for sql, want in exprs:
@@ -1644,6 +1805,14 @@ def main():
     p.add_argument("--no-index", action="store_false", dest="index")
     p.add_argument("--max-reports", type=int, default=3, dest="max_reports")
     p.set_defaults(fn=cmd_join3)
+
+    p = sub.add_parser("like", help="LIKE against GLOB, SQLite's other matcher")
+    p.add_argument("--n", type=int, default=400)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--rows", type=int, default=8)
+    p.add_argument("--null-rate", type=float, default=0.25, dest="null_rate")
+    p.add_argument("--max-reports", type=int, default=3, dest="max_reports")
+    p.set_defaults(fn=cmd_like)
 
     p = sub.add_parser("agg", help="aggregate partitioning")
     p.add_argument("--n", type=int, default=400)

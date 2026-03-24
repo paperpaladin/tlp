@@ -6,19 +6,20 @@ nothing obvious to compare against.
 
 ```
 $ python3 tlp.py tlp --n 500
-TLP: 500 queries, 0 disagreements, 0 skipped, 152 genuinely three-valued (30%)
+TLP: 500 queries, 0 disagreements, 0 skipped, 150 genuinely three-valued (30%)
 
 $ python3 tlp.py selftest
-planted bug           TLP  NoREC    agg  DISTINCT  GROUP  HAVING
-drop-row             100%     0%     0%        0%    73%     73%
-duplicate-row        100%     0%     0%        0%   100%    100%
-null-only             21%     0%     0%        0%    19%     31%
-count-off-by-one       0%   100%     0%        0%     0%      0%
-aggregate-skew         0%     0%    88%        0%     0%      0%
-distinct-dup           0%     0%     0%      100%     0%      0%
-group-skew             0%     0%     0%        0%   100%    100%
-setop-drop-row       100%     0%     0%       73%    73%     73%
-having-drop-group      0%     0%     0%        0%     0%     98%
+planted bug           TLP  NoREC   agg  DISTINCT  GROUP  HAVING   LIKE
+drop-row             100%     0%    0%        0%    79%     79%     0%
+duplicate-row        100%     0%    0%        0%   100%    100%     0%
+null-only             24%     0%    0%        0%    24%     31%     0%
+count-off-by-one       0%   100%    0%        0%     0%      0%     0%
+aggregate-skew         0%     0%   85%        0%     0%      0%     0%
+distinct-dup           0%     0%    0%      100%     0%      0%     0%
+group-skew             0%     0%    0%        0%   100%    100%     0%
+setop-drop-row       100%     0%    0%       79%    79%     79%     0%
+having-drop-group      0%     0%    0%        0%     0%     97%     0%
+glob-skew              0%     0%    0%        0%     0%      0%    27%
 
 every planted bug is caught by at least one oracle
 ```
@@ -120,15 +121,17 @@ Against a database that is behaving perfectly:
 
 | aggregate | correct rule | wrong rule | wrong rule |
 |---|---|---|---|
-| `SUM` | 0 / 210 | `MIN` 150 | `COUNT` 208 |
-| `COUNT` | 0 / 210 | `COUNT` 208 | `MIN` 210 |
-| `MIN` | 0 / 210 | `SUM` 135 | `MAX` 127 |
-| `MAX` | 0 / 210 | `SUM` 135 | `MIN` 125 |
+| `SUM` | 0 / 174 | `MIN` 135 | `COUNT` 174 |
+| `COUNT` | 0 / 210 | `COUNT` 207 | `MIN` 210 |
+| `MIN` | 0 / 210 | `SUM` 176 | `MAX` 111 |
+| `MAX` | 0 / 210 | `SUM` 178 | `MIN` 107 |
 
 Every correct rule raises **no** false alarms; every wrong one raises
 hundreds. `COUNT` is the one to stare at: its combiner is `SUM`, and
 writing `COUNT` there by analogy with the others -- the obvious mistake --
-produces a tool that reports a bug in 208 of 210 correct queries.
+produces a tool that reports a bug in 207 of 210 correct queries. (`SUM`
+runs over fewer checks than the rest because it needs an integer column
+and the generator does not always produce one.)
 
 ## DISTINCT and GROUP BY need opposite composition rules
 
@@ -172,16 +175,17 @@ measured against a database that is behaving correctly:
 | `DISTINCT` recombined with | false alarms | | `GROUP BY` counts recombined with | false alarms |
 |---|---|---|---|---|
 | **`UNION`** | **0 / 200** | | **`SUM`** | **0 / 200** |
-| `UNION ALL` | 113 | | `COUNT` | 196 |
-| `INTERSECT` | 200 | | `MIN` | 113 |
-| `EXCEPT` | 198 | | `MAX` | 113 |
-| | | | `AVG` | 113 |
+| `UNION ALL` | 109 | | `COUNT` | 198 |
+| `INTERSECT` | 200 | | `MIN` | 109 |
+| `EXCEPT` | 192 | | `MAX` | 109 |
+| | | | `AVG` | 109 |
 
-The `113` is the same number four times over, and it is the same event seen
+The `109` is the same number four times over, and it is the same event seen
 from two sides: one value of the column landing in more than one partition.
 `UNION ALL` then keeps it twice, and the per-arm counts then sum to more
 than any single one of them. Measured directly -- a value spans partitions
-in exactly 113 of those 200 cases -- rather than left as a coincidence.
+in exactly that many of the 200 cases -- rather than left as a coincidence,
+and the suite asserts the two counts are equal rather than merely similar.
 
 ### A hidden dependency on three operators agreeing about NULL
 
@@ -504,6 +508,64 @@ four things three ways without leaving an arm empty is simply harder than
 splitting eight. The right comparison for this number is not the row-level
 one.
 
+## Two pattern matchers, pointed at each other
+
+This is the one differential oracle here rather than a metamorphic one,
+and it still needs no second database. **SQLite ships two independent
+pattern matchers.** `LIKE` and `GLOB` are separate implementations with
+separate wildcard syntax, and over a restricted alphabet the two languages
+say the same thing under `%` -> `*` and `_` -> `?`:
+
+```sql
+    SELECT * FROM t WHERE c LIKE 'a%b'
+==  SELECT * FROM t WHERE c GLOB 'a*b'
+```
+
+```
+$ python3 tlp.py like --n 400
+LIKE vs GLOB: 339 queries, 0 disagreements, 61 skipped,
+              112 where the pattern split the table (33%)
+```
+
+Row for row, `NULL` included -- where both must yield NULL rather than
+FALSE. The vacuity question is different again here: a pattern matching no
+row, or every row, makes the two matchers agree trivially, so what is
+reported is how often the pattern actually split the table.
+
+### Two preconditions, both enforced rather than hoped for
+
+**`LIKE` folds ASCII case and `GLOB` never does.** Left alone, the two
+disagree on the first capital letter. So `case_sensitive_like=ON` is pinned
+in a single `connect()` that every connection here goes through, rather
+than at each call site -- a connection that forgot it would not fail
+loudly, it would quietly measure something else. The suite checks that a
+connection *without* the pragma answers differently, which is the only way
+to know the pinning does anything.
+
+**The rewrite is only valid over an alphabet with no `GLOB`
+metacharacters.** This is the part that would hold quietly and then not:
+
+```
+'axb' LIKE 'a*b'   is FALSE   -- * is a literal to LIKE
+'axb' GLOB 'a*b'   is TRUE    -- * is a wildcard to GLOB
+```
+
+and the same for `?`, and for `[`, which opens a character class in `GLOB`
+and is a literal in `LIKE`. Backslash is out too, because `LIKE` takes an
+`ESCAPE` clause and `GLOB` has none. So generated patterns are built only
+from `a`, `b`, `c`, `%` and `_`, `like_to_glob` *asserts* that rather than
+trusting it, and the suite checks both that the assertion fires and that
+translating such a pattern anyway really would change what is matched.
+
+### It reaches the other oracles too
+
+Pattern matching was added to the shared atom generator rather than bolted
+on as a tenth relation, so `LIKE` and `GLOB` now appear inside the
+predicates every other oracle partitions -- about 1 predicate in 4. That
+moved every measured number in this file slightly, which is how the
+README-consistency check in the suite earned its place: it went red on the
+composition tables the moment the generator changed.
+
 ## The generator decides whether any of this means anything
 
 TLP splits rows three ways. A predicate that is never NULL leaves the third
@@ -517,9 +579,9 @@ not assumed, and the suite holds it above a floor:
 ```
 $ python3 tlp.py vacuity --n 600
 600 predicates over 8-row tables, NULL rate 0.25
-   78.0%  have a non-empty NULL partition
-   31.5%  are genuinely three-valued (all three non-empty)
-   12.3%  are constant across every row (partition nothing)
+   77.8%  have a non-empty NULL partition
+   29.8%  are genuinely three-valued (all three non-empty)
+   11.7%  are constant across every row (partition nothing)
 ```
 
 Two generator decisions do all the work, and both are about making
@@ -530,18 +592,20 @@ construction rather than by accident.
 
 The NULL rate has an optimum, which is not obvious until it is measured:
 
-| NULL rate | three-valued | partition nothing |
-|---|---|---|
-| 0.00 | 2% | 53% |
-| 0.15 | 27% | 24% |
-| **0.25** | **32%** | **13%** |
-| 0.45 | 27% | 8% |
-| 0.60 | 22% | 13% |
+| NULL rate | three-valued | has a NULL arm | partition nothing |
+|---|---|---|---|
+| 0.00 | 1% | 15% | 54% |
+| 0.15 | 28% | 66% | 21% |
+| **0.25** | **29%** | **78%** | **12%** |
+| 0.45 | 26% | 88% | 5% |
+| 0.60 | 18% | 87% | 11% |
 
 Too few NULLs and the third partition is empty. Too many and the rows are
 mostly NULL, so the *other* two empty out instead and the predicate becomes
-constant. At 0 it is 2% rather than 0% only because a literal `NULL` can
-still appear inside the predicate itself.
+constant. At 0 it is 1% rather than 0% only because a literal `NULL` can
+still appear inside the predicate itself -- and the NULL-arm column shows
+why that is not the same as 0%: even with no NULL in the data, 15% of
+predicates still produce one.
 
 ## What does not work
 
@@ -556,8 +620,11 @@ No other engines. There is no DuckDB or PostgreSQL on this machine -- which
 is the reason for choosing a metamorphic oracle over differential testing,
 rather than a limitation of it.
 
-No floating point, no collation-dependent operators, no `LIKE`, no
-triggers, views, foreign keys, virtual tables or window functions. Row
+No floating point, no collation-dependent operators, no triggers, views,
+foreign keys, virtual tables or window functions. `LIKE` is in, but only
+with its case folding pinned off and only over a five-character pattern
+alphabet; `ESCAPE` clauses, character classes and `LIKE` on non-text
+columns are all absent. Row
 order is never compared, only sorted multisets, because SQL does not
 promise an order without `ORDER BY` and comparing sequences would report a
 bug every time the planner legitimately changed its mind.
@@ -614,7 +681,7 @@ equivalent mutant rather than a hole.
 
 ```
 $ make test
-113 passed, 0 failed
+123 passed, 0 failed
 ```
 
 No pytest, no network, no dependencies. `sqlite3` is in the standard
