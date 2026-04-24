@@ -25,7 +25,29 @@ it looks: a predicate that is never NULL leaves the third arm empty, and the
 test degenerates into "the engine agrees with itself about TRUE and FALSE",
 which it will. Measuring that is what `tlp vacuity` is for.
 
-    tlp.py truth [--depth N]   three-valued logic, exhaustively
+Eleven relations, and none of them is redundant: for every pair there is a
+planted bug one catches and the other does not. That is measured rather
+than asserted -- `selftest` and `joinselftest` plant the bugs and print
+which relations noticed -- and the measurement has already earned its keep
+by showing that one relation WAS redundant until a bug was written for the
+path only it covers.
+
+    tlp.py truth           three-valued logic, exhaustively (a calibration)
+    tlp.py vacuity         how often the generator is interesting at all
+    tlp.py tlp             ternary partitioning of a WHERE clause
+    tlp.py norec           the same predicate with the optimiser blocked
+    tlp.py distinct        partitioning a DISTINCT, which recombines with UNION
+    tlp.py group           partitioning a GROUP BY, which recombines with SUM
+    tlp.py having          partitioning a HAVING, which partitions GROUPS
+    tlp.py join            partitioning a join's ON clause
+    tlp.py join3           three tables, and the planner's join order
+    tlp.py like            LIKE against GLOB, SQLite's other pattern matcher
+    tlp.py agg             SUM, COUNT, MIN and MAX over the three partitions
+    tlp.py selftest        plant bugs, check which relations notice
+    tlp.py joinselftest    the same, for the four join relations
+    tlp.py reduce          shrink a found case to a minimal one
+
+Exit status: 0 nothing found, 1 a disagreement was found, 2 usage error.
 """
 import argparse
 import itertools
@@ -1564,6 +1586,26 @@ class Corrupt:
         if k == "distinct-dup" and sql.startswith("SELECT DISTINCT") \
                 and "UNION" not in sql and rows:
             return rows + rows[:1]
+        # A per-partition grouped count that is wrong: grouping gone wrong
+        # UNDER A FILTER, which is the one thing the GROUP BY relation
+        # partitions and the HAVING relation never does.
+        #
+        # This bug exists because the table said GROUP was redundant. Its
+        # column was dominated by HAVING's in every row -- same percentage
+        # or lower, on all ten bugs -- which reads as "carrying both is
+        # pointless". What it actually showed is that nothing here modelled
+        # a defect in the path GROUP alone covers. In principle neither
+        # relation subsumes the other: GROUP partitions a WHERE clause
+        # underneath a GROUP BY and re-aggregates the per-arm counts, while
+        # HAVING partitions the HAVING and re-aggregates nothing. This is
+        # the bug that tells them apart.
+        #
+        # The condition picks out the GROUP BY relation's recombined side
+        # alone: it is the only query here carrying GROUP BY and a WHERE
+        # clause and no HAVING.
+        if k == "groupfilter-skew" and "GROUP BY" in sql and "WHERE" in sql \
+                and "HAVING" not in sql and rows and rows[0][1] is not None:
+            return [(rows[0][0], rows[0][1] + 1)] + rows[1:]
         # A group wrongly excluded by a HAVING filter. Only the HAVING
         # relation ever issues a HAVING clause, so only it can see this.
         #
@@ -1585,7 +1627,8 @@ class Corrupt:
 
 BUG_KINDS = ["drop-row", "duplicate-row", "null-only", "count-off-by-one",
              "aggregate-skew", "distinct-dup", "group-skew",
-             "setop-drop-row", "having-drop-group", "glob-skew"]
+             "setop-drop-row", "having-drop-group", "glob-skew",
+             "groupfilter-skew"]
 
 
 JOIN_BUG_KINDS = ["join-drop-pair", "leftjoin-overpad", "reorder-skew"]

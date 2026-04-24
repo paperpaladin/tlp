@@ -20,6 +20,7 @@ group-skew             0%     0%    0%        0%   100%    100%     0%
 setop-drop-row       100%     0%    0%       79%    79%     79%     0%
 having-drop-group      0%     0%    0%        0%     0%     97%     0%
 glob-skew              0%     0%    0%        0%     0%      0%    27%
+groupfilter-skew       0%     0%    0%        0%   100%      0%     0%
 
 every planted bug is caught by at least one oracle
 ```
@@ -99,6 +100,30 @@ was built for and **nothing else**:
   invisible to all of them.
 - None of the five writes a `HAVING` clause, so a group wrongly filtered
   out by one is invisible to all of them.
+
+### The claim is checked as a matrix, because the prose missed something
+
+Arguing non-subsumption one pair at a time, from the shape of the queries,
+is right but it is not a measurement -- and it missed a case.
+
+**The `GROUP BY` column used to be dominated by the `HAVING` column**: the
+same percentage or lower on every single planted bug. Nothing in the
+reasoning above was wrong. In principle neither subsumes the other, because
+`GROUP BY` partitions a `WHERE` clause *underneath* a grouping and
+re-aggregates the per-arm counts, while `HAVING` partitions the `HAVING`
+and re-aggregates nothing. What the table actually showed was that **no
+planted bug modelled a defect in the path `GROUP BY` alone covers** -- so
+on the available evidence, carrying it was pointless.
+
+`groupfilter-skew` is that bug: a per-partition grouped count that is
+wrong, which is grouping gone wrong under a filter. `GROUP BY` catches it
+100% of the time and `HAVING` 0%, and the last row of the table above is
+the two relations finally being told apart.
+
+The suite now checks the whole claim pairwise rather than in prose: for
+every ordered pair of relations there must be some planted bug the first
+catches and the second does not. Deleting `groupfilter-skew` turns it red
+with `GROUP is dominated by HAVING`, which is how the hole was found.
 
 ### One zero in that table is not what it looks like
 
@@ -681,7 +706,7 @@ equivalent mutant rather than a hole.
 
 ```
 $ make test
-123 passed, 0 failed
+126 passed, 0 failed
 ```
 
 No pytest, no network, no dependencies. `sqlite3` is in the standard
