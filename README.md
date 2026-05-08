@@ -101,6 +101,32 @@ was built for and **nothing else**:
 - None of the five writes a `HAVING` clause, so a group wrongly filtered
   out by one is invisible to all of them.
 
+### And the matrix itself was missing four relations
+
+The check above covers the seven single-table relations. It did not cover
+the four join relations, while the module docstring claimed *"eleven
+relations, and none of them is redundant: for every pair there is a planted
+bug one catches and the other does not"*.
+
+That was false. Run over the join half, the same algorithm reports
+**`join3 is dominated by inner`** -- the three-table `ON`-partitioning
+caught nothing the two-table one did not, visible in the table above as
+`48%` sitting under `100%` in the only row either of them scored on. The
+identical hole this section congratulates itself on closing for `GROUP`
+against `HAVING`, one table lower down, with the claim stated for eleven
+relations and asserted for seven.
+
+`join3-drop-pair` is the bug that separates them: a pair lost from a
+`UNION ALL` partition query that mentions `t3`, which is a shape no other
+relation here emits -- the inner and left relations never join `t3`, and the
+reordering relation never partitions. `JOIN3` catches it 48% of the time and
+the other three 0%.
+
+The matrix now runs over both halves. Deleting that one bug turns it red
+with `join3 is dominated by inner`, which is how the hole was found in the
+first place -- by an audit that ran the check over relations the check did
+not reach.
+
 ### The claim is checked as a matrix, because the prose missed something
 
 Arguing non-subsumption one pair at a time, from the shape of the queries,
@@ -370,6 +396,7 @@ planted bug             INNER  LEFT JOIN    JOIN3   REORDER
 join-drop-pair           100%         0%      48%        0%
 leftjoin-overpad           0%       100%       0%        0%
 reorder-skew               0%         0%       0%       30%
+join3-drop-pair            0%         0%      48%        0%
 
 every planted join bug is caught, and by different relations
 ```
@@ -706,7 +733,7 @@ equivalent mutant rather than a hole.
 
 ```
 $ make test
-126 passed, 0 failed
+130 passed, 0 failed
 ```
 
 No pytest, no network, no dependencies. `sqlite3` is in the standard

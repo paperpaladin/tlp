@@ -1303,5 +1303,73 @@ check("every relation catches at least one planted bug", useless, [])
 uncaught = [k for k in matrix if not any(matrix[k].values())]
 check("every planted bug is caught by at least one relation", uncaught, [])
 
+# ------------------------------ nor is any JOIN relation redundant
+#
+# The matrix above covers the seven single-table relations. It did not cover
+# the four join relations, and the module docstring claimed "eleven
+# relations, and none of them is redundant: for every pair there is a
+# planted bug one catches and the other does not."
+#
+# That was false. Run over the join half, the same algorithm reported
+# `join3 is dominated by inner` -- 100/0/0/0 against 48/0/0/0 on every
+# planted join bug, so there was no bug the three-table ON-partitioning
+# caught that the two-table one did not. The identical hole the matrix was
+# written to close for GROUP against HAVING, one table lower down, with the
+# claim stated for 7 of 11 and asserted for 7 of 11.
+#
+# `join3-drop-pair` is the bug that separates them, and this is the check
+# that would have required it.
+
+def join_detection_matrix(n=60, seed=0):
+    names = ("inner", "left", "join3", "reorder")
+    matrix = {}
+    for kind in tlp.JOIN_BUG_KINDS:
+        rnd = random.Random(seed)
+        real = tlp.connect()
+        hits = dict.fromkeys(names, 0)
+        for _ in range(n):
+            specs = tlp.build3(real, rnd, 6, 0.25)
+            t1, t2, _ = specs
+            pred2 = tlp.gen_join_predicate(rnd, t1, t2, 2)
+            pred3 = tlp.gen_join3_predicate(rnd, specs, 2)
+            p12 = "%s.%s = %s.%s" % (t1[0], t1[1][0][0], t2[0], t2[1][0][0])
+            bent = tlp.Corrupt(real, kind)
+            probes = (("inner", lambda: tlp.join_check(bent, pred2)),
+                      ("left", lambda: tlp.leftjoin_check(bent, pred2)),
+                      ("join3", lambda: tlp.join3_check(bent, pred3, p12)),
+                      ("reorder", lambda: tlp.reorder_check(bent, pred3)))
+            for name, fn in probes:
+                try:
+                    hits[name] += bool(fn())
+                except sqlite3.Error:
+                    pass
+        matrix[kind] = hits
+    return names, matrix
+
+
+jnames, jmatrix = join_detection_matrix()
+jdom = []
+for a in jnames:
+    for b in jnames:
+        if a != b and all(jmatrix[k][a] <= jmatrix[k][b] for k in jmatrix):
+            jdom.append("%s is dominated by %s" % (a, b))
+check("no join relation's detection is dominated by another's", jdom, [])
+check("every join relation catches at least one planted join bug",
+      [a for a in jnames if not any(jmatrix[k][a] for k in jmatrix)], [])
+check("every planted join bug is caught by at least one join relation",
+      [k for k in jmatrix if not any(jmatrix[k].values())], [])
+
+# The bug that separates join3 from inner, named, so deleting it is visibly
+# what turns the check above red rather than something mysterious.
+ok("join3-drop-pair is caught by the three-table partitioning (%d of 60) "
+   "and by nothing else"
+   % jmatrix["join3-drop-pair"]["join3"]) \
+    if (jmatrix["join3-drop-pair"]["join3"] > 10
+        and jmatrix["join3-drop-pair"]["inner"] == 0
+        and jmatrix["join3-drop-pair"]["left"] == 0
+        and jmatrix["join3-drop-pair"]["reorder"] == 0) else \
+    no("join3-drop-pair is not caught by join3 alone",
+       repr(jmatrix["join3-drop-pair"]))
+
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)
