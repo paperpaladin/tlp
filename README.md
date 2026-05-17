@@ -161,7 +161,7 @@ planted bug's trigger, not of the relation.
 
 Separating the two explanations costs one more planted bug. `setop-drop-row`
 is the same lost row fired on any set operation, and the `DISTINCT` column
-moves to 80% -- so the relation sees lost rows fine, and it was the bug
+moves to 79% -- so the relation sees lost rows fine, and it was the bug
 that could not see the relation. The last row of the table exists only to
 answer that question, and without it the table would be quietly overclaiming.
 
