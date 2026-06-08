@@ -52,7 +52,7 @@ data, any engine.
 That is TLP, ternary logic partitioning (Rigger and Su, OOPSLA 2020).
 It needs no second implementation, no stored expectation, and no model of
 what the query means. It cannot be satisfied by being self-consistently
-wrong, which is the failure mode a hand-written expected output has.
+wrong. A hand-written expected output fails in exactly that way.
 
 NoREC (Rigger and Su, ESEC/FSE 2020) attacks from the other side. The
 same predicate in a `WHERE` clause can be answered from an index. In the
@@ -117,13 +117,13 @@ against `HAVING`, one table lower down, with the claim stated for eleven
 relations and asserted for seven.
 
 `join3-drop-pair` is the bug that separates them: a pair lost from a
-`UNION ALL` partition query that mentions `t3`, which is a shape no other
-relation here emits: the inner and left relations never join `t3`, and the
+`UNION ALL` partition query that mentions `t3`. No other relation here
+emits that shape: the inner and left relations never join `t3`, and the
 reordering relation never partitions. `JOIN3` catches it 48% of the time and
 the other three 0%.
 
 The matrix now runs over both halves. Deleting that one bug turns it red
-with `join3 is dominated by inner`, which is how the hole was found in the
+with `join3 is dominated by inner`. That is how the hole surfaced in the
 first place, by an audit that ran the check over relations the check did
 not reach.
 
@@ -142,14 +142,14 @@ planted bug modelled a defect in the path `GROUP BY` alone covers**, so
 on the available evidence, carrying it was pointless.
 
 `groupfilter-skew` is that bug: a per-partition grouped count that is
-wrong, which is grouping gone wrong under a filter. `GROUP BY` catches it
+wrong. Grouping gone wrong underneath a filter. `GROUP BY` catches it
 100% of the time and `HAVING` 0%, and the last row of the table above is
 the two relations finally being told apart.
 
 The suite now checks the whole claim pairwise instead of in prose: for
 every ordered pair of relations there must be some planted bug the first
 catches and the second does not. Deleting `groupfilter-skew` turns it red
-with `GROUP is dominated by HAVING`, which is how the hole was found.
+with `GROUP is dominated by HAVING`. The hole was found the same way.
 
 ### One zero in that table is not what it looks like
 
@@ -345,7 +345,7 @@ aggregates decides whether the third arm exists at all:
 Same interior optimum as the row-level NULL rate, and for the same reason:
 more NULLs fill the third arm but empty the other two. `having` is the one
 command whose NULL-rate default is 0.40, not 0.25, because a group
-goes NULL only when every value in it is NULL, which takes more NULLs
+goes NULL only when every value in it is NULL, and that takes more NULLs
 than making one row's predicate go NULL.
 
 18% is far below the row-level 29%, and the reason is structural rather
@@ -374,7 +374,7 @@ three `ON`-partitions are a partition of the cross product:
 ==  t1, t2
 ```
 
-The same trick does not work for a `LEFT JOIN`, which is the part worth
+The same trick does not work for a `LEFT JOIN`. That is the part worth
 getting right instead of assuming. Each arm pads its own unmatched rows,
 so the padding is counted three times over. What is true instead is a
 decomposition: a left join is its inner join plus one row for every left
@@ -417,7 +417,7 @@ the cross product instead of keeping all of it or none.
 
 Two tables give a planner one join and two orders to do it in. Three give
 it a real choice, and **reordering is where a planner has the most freedom
-to be wrong**, which is why, for as long as only two tables existed here,
+to be wrong**. For as long as only two tables existed here,
 this file had to admit that the most interesting thing about joins was
 barely being exercised.
 
@@ -494,7 +494,7 @@ cross-table comparisons and the planner has reasons to reorder with or
 without the help.
 
 The test written to assert the equality lever **passed on noise**: 58%
-against 64% at 200 cases, which is 61% against 60% at 500. What is asserted
+against 64% at 200 cases, and 61% against 60% at 500. What is asserted
 now is the combined effect, whose margin is 15 to 19 points; the individual
 rates are printed without an assertion the sample size cannot support.
 
@@ -529,8 +529,8 @@ disagree on the first capital letter. So `case_sensitive_like=ON` is pinned
 in a single `connect()` that every connection here goes through, rather
 than at each call site: a connection that forgot it would not fail
 loudly, it would quietly measure something else. The suite checks that a
-connection *without* the pragma answers differently, which is the only way
-to know the pinning does anything.
+connection *without* the pragma answers differently. Nothing else
+establishes that the pinning does anything.
 
 **The rewrite is only valid over an alphabet with no `GLOB`
 metacharacters.** This is the part that would hold quietly and then not:
@@ -552,8 +552,8 @@ translating such a pattern anyway really would change what is matched.
 Pattern matching was added to the shared atom generator instead of bolted
 on as a tenth relation, so `LIKE` and `GLOB` now appear inside the
 predicates every other oracle partitions: about 1 predicate in 4. That
-moved every measured number in this file slightly, which is how the
-README-consistency check in the suite earned its place: it went red on the
+moved every measured number in this file slightly. The README-consistency
+check in the suite earned its place right there: it went red on the
 composition tables the moment the generator changed.
 
 ## Shrinking a case to something a human will read
@@ -569,7 +569,7 @@ keeping any change that leaves the case still failing.
 **The only property that matters is soundness: what comes out must still
 fail.** A reducer that shrinks past the bug emits a minimal case that
 reproduces nothing and sends whoever reads it hunting for a bug that is not
-there, which is strictly worse than printing the unreduced version. Every
+there, and a case that reproduces nothing is worse than an unreduced one. Every
 reduction asserts it on its own output:
 
 ```
@@ -590,7 +590,7 @@ That output is worth reading twice. `null-only` is the narrow planted bug:
 it fires only above two rows and only when the predicate itself mentions
 NULL. The reducer was told neither thing, and landed on exactly three rows
 and exactly `c0 IS NULL`. It rediscovered the bug's trigger condition by
-shrinking, which is what a reducer is for.
+shrinking. A reducer exists to do exactly that.
 
 Because the bugs are planted, their true floors are known, so the suite can
 assert the reducer reaches them, and not merely that it gets smaller:
@@ -615,14 +615,14 @@ improvement.
 So candidates are now strictly below the current value on a total order:
 NULL, then 0 or the empty string, then everything else, and the suite
 asserts no candidate leads back to the value it replaced. Deleting the
-strictness makes the test run hang instead of failing, which is the honest
-way for that mutation to show up.
+strictness makes the test run hang instead of failing. For that mutation,
+hanging is the honest failure.
 
 ## The generator decides whether any of this means anything
 
 TLP splits rows three ways. A predicate that is never NULL leaves the third
 arm empty, and the relation degenerates into *"the engine agrees with
-itself about TRUE and FALSE"*, which it will, forever, while printing a
+itself about TRUE and FALSE"*. It will, forever, while printing a
 large and encouraging number.
 
 So the fraction of predicates that are genuinely three-valued is measured,
@@ -642,7 +642,7 @@ short strings, because random 64-bit integers would make `a = b` false
 for every pair of rows that ever existed. And NULLs are frequent by
 construction, not by accident.
 
-The NULL rate has an optimum, which is not obvious until it is measured:
+The NULL rate has an optimum. It is not obvious until measured:
 
 | NULL rate | three-valued | has a NULL arm | partition nothing |
 |---|---|---|---|
@@ -665,11 +665,11 @@ It has never found a bug in SQLite, and probably will not. SQLite is
 among the most heavily tested software in existence, and the published runs
 of these exact techniques already took what was there. A run reporting
 nothing is the expected outcome. What this has to prove is that it *would*
-report something, which is what `selftest` is for and why the planted-bug
-table is the first thing in this file.
+report something. `selftest` exists for that, and it is why the planted-bug
+table opens this file.
 
-No other engines. There is no DuckDB or PostgreSQL on this machine, which
-is the reason for choosing a metamorphic oracle over differential testing,
+No other engines. There is no DuckDB or PostgreSQL on this machine. A
+metamorphic oracle was chosen for that reason and not as a concession to it,
 not a limitation of it.
 
 No floating point, no collation-dependent operators, no triggers, views,
@@ -683,15 +683,15 @@ bug every time the planner legitimately changed its mind.
 
 The reducer shrinks rows, the predicate tree and values. It does not
 shrink the SCHEMA: an unused column stays in the `CREATE TABLE` even when
-no surviving part of the predicate mentions it, which is visible in the
-worked example above.
+no surviving part of the predicate mentions it. The worked example above
+shows this happening.
 
 `GROUP BY` is partitioned only for `COUNT(*)`, and only on a single
 grouping column.
 
 The planted bugs cannot distinguish two sound relations. They wrap the
 connection and corrupt result sets, so they model a wrong answer but never
-a wrong plan, which is why the two-arm and three-arm splits score
+a wrong plan. The two-arm and three-arm splits therefore score
 identically above. Every percentage in the first table is a measurement of
 "would this relation notice a result that is wrong in this specific way",
 and none of them is a measurement of how much of the optimiser gets
@@ -705,7 +705,7 @@ planner's order against the written one, it never asks for a specific
 cannot be made to choose a wrong order on request, so what gets corrupted
 is the `CROSS JOIN` form, whose order is pinned. The effect on the relation
 matches a planner that got the free order wrong. The limitation is that a
-real reordering bug would also change the plan, which this cannot.
+real reordering bug would also change the plan, and this cannot.
 
 ## The one hand-written thing, and why
 
@@ -713,11 +713,11 @@ real reordering bug would also change the plan, which this cannot.
 checks all 34,353 expressions of the grammar up to depth 2 against SQLite.
 
 That is the only place here where an expected answer is written down by
-hand, which is the thing this project otherwise refuses to do, so it is
+hand, the one thing this project otherwise refuses to do, so it is
 labelled a calibration, not an oracle. It exists to prove the
 model of three-valued logic the generator rests on matches the engine
 before anything is built on it. The fuzzer's oracle is the metamorphic
-relation, which needs no tables at all.
+relation, and it needs no tables at all.
 
 And because a conformance check that passes on its first run has not been
 shown to work, the suite breaks it four ways: an `AND` where FALSE does
@@ -737,7 +737,7 @@ $ make test
 ```
 
 No pytest, no network, no dependencies. `sqlite3` is in the standard
-library, which is the whole toolchain.
+library, so that is the whole toolchain.
 
 ## License
 
