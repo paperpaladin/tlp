@@ -76,7 +76,7 @@ Ranked by how little of it we control.
 2. The SQL standard's three-valued truth tables, transcribed in
    `tlp.py` and checked exhaustively against SQLite. This is a
    CALIBRATION, not the oracle, and the distinction matters: the tables are
-   written down by hand here, which is exactly the thing this project
+   written down by hand here, exactly the thing this project
    otherwise avoids. They exist to prove the model of three-valued logic
    the generator is built on matches the engine, before anything is built
    on it. 34,353 expressions at depth 2.
@@ -94,13 +94,13 @@ Crash finding. Fuzzers that look for segfaults in SQLite already exist and
 are better at it. This is for wrong answers, which they cannot see.
 
 Other engines. There is no DuckDB or PostgreSQL on this machine, and a
-metamorphic oracle does not need one, which is the reason for choosing
+metamorphic oracle does not need one, and that is the reason for choosing
 this technique over differential testing, not a limitation of it.
 
 Finding a bug in SQLite. SQLite is among the most heavily tested software
 in existence and the published results for these techniques found most of
 what was there. A run that reports nothing is the expected outcome; what
-this has to prove is that it WOULD report something, which is what the
+this has to prove is that it WOULD report something, the thing the
 planted-defect checks are for.
 
 Schema features beyond what the generator emits: no triggers, no views, no
@@ -526,7 +526,7 @@ is a design claim nobody has tested.
 - RESOLVED by item 12. Yes, with the case folding pinned, not the
   collation: `case_sensitive_like=ON` in a single `connect()`. The pragma
   bought more than access to `LIKE`. It made `GLOB` usable as `LIKE`'s
-  reference implementation, which is the only differential oracle in this
+  reference implementation, the only differential oracle in this
   project.
 - Whether the planted bugs can be made to model a wrong PLAN, not a
   wrong RESULT. They wrap the connection and corrupt result sets, which is
