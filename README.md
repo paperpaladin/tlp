@@ -1,7 +1,7 @@
 # tlp
 
 Finds queries where SQLite returns the **wrong rows**. Not a crash, not an
-error: a result that differs from what the data says it should be, with
+error. A result that differs from what the data says it should be, with
 nothing obvious to compare against.
 
 ```
@@ -146,7 +146,7 @@ wrong. Grouping gone wrong underneath a filter. `GROUP BY` catches it
 100% of the time and `HAVING` 0%, and the last row of the table above is
 the two relations finally being told apart.
 
-The suite now checks the whole claim pairwise instead of in prose: for
+The suite now checks the whole claim pairwise instead of in prose. For
 every ordered pair of relations there must be some planted bug the first
 catches and the second does not. Deleting `groupfilter-skew` turns it red
 with `GROUP is dominated by HAVING`. The hole was found the same way.
@@ -178,7 +178,7 @@ Against a database that is behaving perfectly:
 | `MAX` | 0 / 210 | `SUM` 178 | `MIN` 107 |
 
 Every correct rule raises no false alarms; every wrong one raises
-hundreds. `COUNT` is the one to stare at: its combiner is `SUM`, and
+hundreds. `COUNT` is the one to stare at. Its combiner is `SUM`, and
 writing `COUNT` there by analogy with the others: the obvious mistake,
 produces a tool that reports a bug in 207 of 210 correct queries. (`SUM`
 runs over fewer checks than the rest because it needs an integer column
@@ -377,7 +377,7 @@ three `ON`-partitions are a partition of the cross product:
 The same trick does not work for a `LEFT JOIN`. That is the part worth
 getting right instead of assuming. Each arm pads its own unmatched rows,
 so the padding is counted three times over. What is true instead is a
-decomposition: a left join is its inner join plus one row for every left
+decomposition. A left join is its inner join plus one row for every left
 row that found no TRUE match anywhere:
 
 ```sql
@@ -518,7 +518,7 @@ LIKE vs GLOB: 339 queries, 0 disagreements, 61 skipped,
 ```
 
 Row for row, `NULL` included, where both must yield NULL,
-not FALSE. The vacuity question is different again here: a pattern matching no
+not FALSE. The vacuity question is different again here. A pattern matching no
 row, or every row, makes the two matchers agree trivially, so what is
 reported is how often the pattern actually split the table.
 
@@ -553,7 +553,7 @@ Pattern matching was added to the shared atom generator instead of bolted
 on as a tenth relation, so `LIKE` and `GLOB` now appear inside the
 predicates every other oracle partitions: about 1 predicate in 4. That
 moved every measured number in this file slightly. The README-consistency
-check in the suite earned its place right there: it went red on the
+check in the suite earned its place right there. It went red on the
 composition tables the moment the generator changed.
 
 ## Shrinking a case to something a human will read
@@ -720,11 +720,11 @@ before anything is built on it. The fuzzer's oracle is the metamorphic
 relation, and it needs no tables at all.
 
 And because a conformance check that passes on its first run has not been
-shown to work, the suite breaks it four ways: an `AND` where FALSE does
+shown to work, the suite breaks it four ways. An `AND` where FALSE does
 not dominate, an `OR` where TRUE does not, a `NOT` that turns NULL into
 FALSE, an `=` that does not propagate NULL, and asserts it notices each.
 
-A fifth rewrite survives and is recorded as surviving: changing `a is b` to
+A fifth rewrite survives and is recorded as surviving. Changing `a is b` to
 `a == b` in the `IS` table changes nothing, because on the domain
 `{True, False, None}` Python's two operators agree everywhere. An
 equivalent mutant, not a hole.
