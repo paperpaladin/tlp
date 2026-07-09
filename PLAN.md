@@ -502,8 +502,7 @@ Not a planned item. It came out of reading the selftest table,
 not the plan, and it is recorded here because it changed what the table means.
 
 The GROUP BY column was dominated by the HAVING column, the same
-percentage or lower on all ten planted bugs. The prose argument for
-carrying both was and is correct: GROUP BY partitions a WHERE clause
+percentage or lower on all ten planted bugs. That prose argument was and is correct: GROUP BY partitions a WHERE clause
 underneath a grouping and re-aggregates the per-arm counts, HAVING
 partitions the HAVING and re-aggregates nothing, and neither subsumes the
 other. But the TABLE said otherwise, because nothing modelled a defect in
@@ -536,7 +535,7 @@ is a design claim nobody has tested.
 - RESOLVED by item 06. Reduction does both, and the data axis matters
   more: rows go 10 -> 1 while predicates go 13 nodes -> 1. The two
   interact in the direction that helps, since a smaller predicate makes
-  more rows droppable. The axis that caused trouble was neither. It was
+  more rows droppable. Neither was the axis that caused trouble. It was
   shrinking VALUES, which needs a well-founded order or the loop runs
   forever.
 - Whether the schema should shrink too. An unused column survives into the
