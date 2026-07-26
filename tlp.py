@@ -25,7 +25,7 @@ it looks: a predicate that is never NULL leaves the third arm empty, and the
 test degenerates into "the engine agrees with itself about TRUE and FALSE",
 which it will. Measuring that is what `tlp vacuity` is for.
 
-Eleven relations, and none of them is redundant: for every pair there is a
+Twelve relations, and none of them is redundant: for every pair there is a
 planted bug one catches and the other does not. That is measured rather
 than asserted -- `selftest` and `joinselftest` plant the bugs and print
 which relations noticed -- and the measurement has earned its keep twice,
@@ -44,6 +44,7 @@ check covered seven.
     tlp.py join            partitioning a join's ON clause
     tlp.py join3           three tables, and the planner's join order
     tlp.py like            LIKE against GLOB, SQLite's other pattern matcher
+    tlp.py view            a view and a CTE against the query they name
     tlp.py agg             SUM, COUNT, MIN and MAX over the three partitions
     tlp.py selftest        plant bugs, check which relations notice
     tlp.py joinselftest    the same, for the four join relations
@@ -1453,6 +1454,164 @@ def cmd_group(args):
                       "GROUP BY")
 
 
+# ------------------------------------- a view and a CTE, the same query
+#
+# Every relation above compares two queries over base tables. A view is
+# the same query wearing a name, and SQLite either flattens it into the
+# outer query or materialises it, so a rename is the cheapest second plan
+# available here and it needs no second engine.
+#
+# One logical query, four renderings. The flat one is the reference,
+# because it is SQLite answering the query with no nesting at all:
+#
+#     SELECT c0, c1 FROM t WHERE (p) AND (q)                     -- flat
+#
+#     CREATE VIEW v AS SELECT c0, c1 FROM t WHERE (p);
+#     SELECT * FROM v WHERE (q)                                  -- view
+#
+#     WITH w AS (SELECT c0, c1 FROM t WHERE (p))
+#     SELECT * FROM w WHERE (q)                                  -- CTE
+#
+#     WITH w AS MATERIALIZED (...) SELECT * FROM w WHERE (q)      -- forced
+#
+# Filtering by q what p has already kept is the rows where both are TRUE,
+# which is the conjunction, so the flat query means the same thing. The
+# outer filter is what makes the shape worth issuing: with nothing outside
+# the view there is no predicate to push anywhere and so no decision to
+# get wrong.
+#
+# Each named form is compared against the FLAT form and never against
+# another named form. A view against a CTE would prove nothing about
+# either: both are wrapped renderings of one query, so a defect in the
+# flat path leaves them equal and agreeing. The suite measures that both
+# ways, with a defect planted in the flat query alone.
+#
+# The other way this relation can prove nothing is by reaching the same
+# plan twice, the hazard the reordering relation has. Here it is not
+# hypothetical. SQLite flattens a view over a plain filter into exactly
+# the plan of the flat query, every time, so on that shape the view and
+# the plain CTE are a query compared against itself. DISTINCT in the view
+# body blocks the flattening and MATERIALIZED blocks it unconditionally,
+# which is why both are here and why the rate is reported per run.
+#
+# And an empty result satisfies any equality, so the rows actually
+# compared are counted and reported too.
+
+# How the flat query combines the two predicates. Filtering twice keeps
+# the rows where both are TRUE. OR is the obvious wrong rule, and "inner"
+# forgets the outer filter altogether; both raise false alarms in
+# quantity, measured in the suite.
+VIEW_RULE = "AND"
+
+
+def view_queries(cols, pred, outer, distinct=False, rule=VIEW_RULE):
+    """One logical query, flat and in three named forms."""
+    cl = ", ".join(c for c, _ in cols)
+    d = "DISTINCT " if distinct else ""
+    inner = "SELECT %s%s FROM t WHERE (%s)" % (d, cl, pred)
+    if rule == "inner":
+        flat = inner
+    else:
+        flat = "SELECT %s%s FROM t WHERE (%s) %s (%s)" % (d, cl, pred, rule,
+                                                          outer)
+    named = (("view", "SELECT * FROM v WHERE (%s)" % outer),
+             ("CTE", "WITH w AS (%s) SELECT * FROM w WHERE (%s)"
+              % (inner, outer)),
+             ("materialized",
+              "WITH w AS MATERIALIZED (%s) SELECT * FROM w WHERE (%s)"
+              % (inner, outer)))
+    return inner, flat, named
+
+
+def view_results(db, cols, pred, outer, distinct=False, rule=VIEW_RULE):
+    """The flat answer and each named form's. Creates the view itself."""
+    inner, flat, named = view_queries(cols, pred, outer, distinct, rule)
+    db.execute("DROP VIEW IF EXISTS v")
+    db.execute("CREATE VIEW v AS " + inner)
+    return rows_of(db, flat), [(n, rows_of(db, q)) for n, q in named]
+
+
+def view_check(db, cols, pred, outer, distinct=False, rule=VIEW_RULE):
+    """Every named form against the flat query, none against each other."""
+    flat, got = view_results(db, cols, pred, outer, distinct, rule)
+    for name, rows in got:
+        if rows != flat:
+            return ("VIEW/%s" % name, len(flat), len(rows))
+    return None
+
+
+def view_plans(db, cols, pred, outer, distinct=False):
+    """Which named forms SQLite plans differently from the flat query.
+
+    This relation's vacuity measurement, and EXPLAIN QUERY PLAN is
+    SQLite's own account of what it decided. Run it after view_results,
+    which is what creates the view the first form reads.
+    """
+    _, flat, named = view_queries(cols, pred, outer, distinct)
+
+    def plan(sql):
+        return tuple(r[3] for r in db.execute("EXPLAIN QUERY PLAN " + sql))
+
+    base = plan(flat)
+    return [(name, plan(q) != base) for name, q in named]
+
+
+def cmd_view(args):
+    """The four renderings, with the plan difference and the rows reported.
+
+    Rows compared is in the report because it is the other way this
+    relation can mean nothing: the flat form and the view form of a query
+    returning no rows agree whatever either of them does, so a run whose
+    comparisons were all empty would print a long row of agreements and
+    be worth none of them.
+    """
+    import random
+    rnd = random.Random(args.seed)
+    db = connect()
+    found = tested = skipped = unflattened = compared = 0
+
+    for i in range(args.n):
+        ddl, cols, rows = build(db, rnd, args.rows, args.null_rate)
+        if args.index:
+            db.execute("CREATE INDEX IF NOT EXISTS i0 ON t(%s)" % cols[0][0])
+        pred = gen_predicate(rnd, cols, args.depth)
+        outer = gen_atom(rnd, cols)
+        # DISTINCT in the view body is what stops SQLite flattening the
+        # view away, so half the cases carry it and the report says how
+        # often the rename reached a second plan.
+        distinct = rnd.random() < 0.5
+        try:
+            flat, got = view_results(db, cols, pred, outer, distinct)
+            moved = dict(view_plans(db, cols, pred, outer, distinct))
+        except sqlite3.Error:
+            skipped += 1
+            continue
+        tested += 1
+        compared += len(flat)
+        unflattened += moved["view"]
+        bad = next(((n, len(flat), len(r)) for n, r in got if r != flat), None)
+        if bad:
+            found += 1
+            inner, flat_sql, _ = view_queries(cols, pred, outer, distinct)
+            print("FOUND  view disagreement on seed step %d" % i)
+            print("  %s" % ddl)
+            for r in rows:
+                print("  INSERT INTO t VALUES (%s);"
+                      % ", ".join(sql_literal(v) for v in r))
+            print("  CREATE VIEW v AS %s;" % inner)
+            print("  flat form: %s" % flat_sql)
+            print("  the %s form returns %d rows, the flat query %d"
+                  % (bad[0], bad[2], bad[1]))
+            if found >= args.max_reports:
+                break
+
+    print("view and CTE: %d queries, %d disagreements, %d skipped, "
+          "%d rows compared, %d where the view was not flattened (%.0f%%)"
+          % (tested, found, skipped, compared, unflattened,
+             100.0 * unflattened / tested if tested else 0.0))
+    return 1 if found else 0
+
+
 # ------------------------------------------------------------- selftest
 #
 # Both oracles report nothing against SQLite, and will keep reporting
@@ -1643,13 +1802,26 @@ class Corrupt:
         if k == "group-skew" and "GROUP BY" in sql and "UNION" not in sql \
                 and rows and rows[0][1] is not None:
             return [(rows[0][0], rows[0][1] + 1)] + rows[1:]
+        # A row lost on the path through a NAME, and nowhere else. This is
+        # the defect the view relation exists for: a query flattened into
+        # or materialised out of a wrapper, answering differently from the
+        # query it was written as.
+        #
+        # The condition names the two shapes that read a name -- a select
+        # from the view, and a WITH -- and no other relation here emits
+        # either, so no other relation can see this. The flat query is
+        # left alone deliberately: corrupting both sides would have the
+        # relation agree with itself and report nothing.
+        if k == "view-skew" and ("FROM v WHERE" in sql or "WITH w AS" in sql) \
+                and rows:
+            return rows[:-1]
         return rows
 
 
 BUG_KINDS = ["drop-row", "duplicate-row", "null-only", "count-off-by-one",
              "aggregate-skew", "distinct-dup", "group-skew",
              "setop-drop-row", "having-drop-group", "glob-skew",
-             "groupfilter-skew"]
+             "groupfilter-skew", "view-skew"]
 
 
 JOIN_BUG_KINDS = ["join-drop-pair", "leftjoin-overpad", "reorder-skew",
@@ -1712,13 +1884,13 @@ def cmd_selftest(args):
     import random
     real = connect()
 
-    print("%-18s %6s %6s %5s %9s %6s %7s %6s"
+    print("%-18s %6s %6s %5s %9s %6s %7s %6s %6s"
           % ("planted bug", "TLP", "NoREC", "agg", "DISTINCT", "GROUP",
-             "HAVING", "LIKE"))
+             "HAVING", "LIKE", "VIEW"))
     worst = {}
     for kind in BUG_KINDS:
         hits = dict.fromkeys(("TLP", "NoREC", "agg", "DISTINCT", "GROUP",
-                              "HAVING", "LIKE"), 0)
+                              "HAVING", "LIKE", "VIEW"), 0)
         rnd = random.Random(args.seed)
         for _ in range(args.n):
             _, cols, _ = build(real, rnd, args.rows, args.null_rate)
@@ -1762,7 +1934,15 @@ def cmd_selftest(args):
                         hits["LIKE"] += 1
                 except sqlite3.Error:
                     pass
-        print("%-18s %5d%% %5d%% %4d%% %8d%% %5d%% %6d%% %5d%%"
+            # The view relation needs a filter to sit outside the view and
+            # a coin for whether the view body dedupes.
+            try:
+                if view_check(bent, cols, pred, gen_atom(rnd, cols),
+                              rnd.random() < 0.5):
+                    hits["VIEW"] += 1
+            except sqlite3.Error:
+                pass
+        print("%-18s %5d%% %5d%% %4d%% %8d%% %5d%% %6d%% %5d%% %5d%%"
               % (kind,
                  100 * hits["TLP"] // args.n,
                  100 * hits["NoREC"] // args.n,
@@ -1770,7 +1950,8 @@ def cmd_selftest(args):
                  100 * hits["DISTINCT"] // args.n,
                  100 * hits["GROUP"] // args.n,
                  100 * hits["HAVING"] // args.n,
-                 100 * hits["LIKE"] // args.n))
+                 100 * hits["LIKE"] // args.n,
+                 100 * hits["VIEW"] // args.n))
         worst[kind] = max(hits.values())
 
     missed = [k for k, v in worst.items() if v == 0]
@@ -1815,7 +1996,9 @@ def main():
     for name, fn, helptext in (("tlp", cmd_tlp, "ternary partitioning"),
                                ("norec", cmd_norec, "optimised vs unoptimised"),
                                ("distinct", cmd_distinct, "partition a DISTINCT"),
-                               ("group", cmd_group, "partition a GROUP BY")):
+                               ("group", cmd_group, "partition a GROUP BY"),
+                               ("view", cmd_view,
+                                "a view and a CTE against the flat query")):
         q = sub.add_parser(name, help=helptext)
         q.add_argument("--n", type=int, default=500)
         q.add_argument("--seed", type=int, default=0)

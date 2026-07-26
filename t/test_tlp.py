@@ -890,6 +890,214 @@ check("...and nothing else writes HAVING, so nothing else can see it",
       [h[k] for k in ("TLP", "NoREC", "agg", "DISTINCT", "GROUP")],
       [0, 0, 0, 0, 0])
 
+# ------------------------------------- a view and a CTE, the same query
+#
+# A view is the same query wearing a name, and SQLite either flattens it
+# into the outer query or materialises it. So one logical query gets four
+# renderings -- flat, through a view, through a CTE, through a CTE forced
+# to materialise -- and each named form is compared against the FLAT one.
+#
+# Two ways this relation could prove nothing, and both are measured here
+# rather than argued.
+#
+# Comparing the view against the CTE instead would be the easy mistake.
+# They are two wrappers around one query, so a defect in the flat path
+# leaves them equal and agreeing, and the comparison reports nothing while
+# looking exactly as busy.
+#
+# And an empty result set satisfies any equality, so the rows actually
+# compared are counted. Zero alarms over zero rows is what this relation
+# looks like when it has stopped testing anything.
+
+def view_alarms(n=200, seed=0, **kw):
+    """False alarms, and how much was actually compared."""
+    rnd = random.Random(seed)
+    db = tlp.connect()
+    alarms = tested = rows = nonempty = 0
+    for _ in range(n):
+        _, cols, _ = tlp.build(db, rnd, 8, 0.25)
+        pred = tlp.gen_predicate(rnd, cols, 2)
+        outer = tlp.gen_atom(rnd, cols)
+        distinct = rnd.random() < 0.5
+        try:
+            flat, got = tlp.view_results(db, cols, pred, outer, distinct, **kw)
+        except sqlite3.Error:
+            continue
+        tested += 1
+        rows += len(flat)
+        nonempty += bool(flat)
+        alarms += any(r != flat for _, r in got)
+    return alarms, tested, rows, nonempty
+
+
+# As shipped, with no keyword, so the default rule is what is under test.
+alarms, tested, rows, nonempty = view_alarms()
+check("the view relation as shipped raises no false alarm", alarms, 0)
+check("...and the default rule is the conjunction",
+      tlp.view_check.__defaults__, (False, "AND"))
+# The number that makes the line above mean something. An agreement over
+# no rows is an agreement about nothing.
+ok("...over %d rows in %d queries, %d of them returning a row"
+   % (rows, tested, nonempty)) if rows > tested // 4 and nonempty > tested // 5 \
+    else no("the view relation compared almost nothing",
+            "%d rows, %d non-empty, in %d queries" % (rows, nonempty, tested))
+
+# The flat form's rule is load-bearing. Filtering by q what p already kept
+# is the conjunction; OR keeps rows the view never passed on, and dropping
+# the outer filter keeps rows it filtered out.
+for rule, label, floor in (("OR", "`OR` for `AND`", 0.3),
+                           ("inner", "the outer filter dropped", 0.3)):
+    a, t, _, _ = view_alarms(rule=rule)
+    MEASURED[label] = a
+    if a >= floor * t:
+        ok("view: %s raises %d false alarms in %d" % (label, a, t))
+    else:
+        no("view: %s is not load-bearing" % label, "%d in %d" % (a, t))
+
+
+# The view has to express the INNER query. Built from the flat query
+# instead it still agrees row for row, because applying the outer filter
+# twice changes nothing, and the push-down this relation exists to test is
+# then not in the query at all. That mutation survived everything else
+# here, so the body is read directly.
+rnd = random.Random(2)
+db = tlp.connect()
+body_ok = narrower = tested = 0
+for _ in range(200):
+    _, cols, _ = tlp.build(db, rnd, 8, 0.25)
+    pred = tlp.gen_predicate(rnd, cols, 2)
+    outer = tlp.gen_atom(rnd, cols)
+    inner, flat, _ = tlp.view_queries(cols, pred, outer)
+    try:
+        tlp.view_results(db, cols, pred, outer)
+        body = tlp.rows_of(db, "SELECT * FROM v")
+        want = tlp.rows_of(db, inner)
+        rest = tlp.rows_of(db, flat)
+    except sqlite3.Error:
+        continue
+    tested += 1
+    body_ok += (body == want)
+    narrower += (rest != want)
+check("the view's body is the inner query, not the flat one",
+      (body_ok, tested), (tested, tested))
+ok("...and the outer filter removes rows from it in %d of %d cases, so the "
+   "two are distinguishable" % (narrower, tested)) if narrower > tested // 4 \
+    else no("the outer filter almost never removes a row",
+            "%d of %d" % (narrower, tested))
+
+
+def flat_only_detection(kind, n=200, seed=1):
+    """One defect, against the shipped comparison and against view-vs-CTE.
+
+    `distinct-dup` duplicates a row in any query beginning SELECT
+    DISTINCT, which with a dedup in the view body is the flat form and
+    nothing else, so it is a defect on the reference path alone.
+    `view-skew` is the opposite, a row lost from every named form.
+
+    Each named form against the flat query catches both. The view against
+    the CTE catches neither, because in the first case both wrappers are
+    clean and in the second both are corrupted the same way.
+    """
+    rnd = random.Random(seed)
+    real = tlp.connect()
+    shipped = pairwise = tested = 0
+    for _ in range(n):
+        _, cols, _ = tlp.build(real, rnd, 8, 0.25)
+        pred = tlp.gen_predicate(rnd, cols, 2)
+        outer = tlp.gen_atom(rnd, cols)
+        bent = tlp.Corrupt(real, kind)
+        try:
+            # The shipped side goes through view_check itself. Re-deriving
+            # the comparison here would leave the shipped one unchecked:
+            # pointing it at the view instead of the flat query keeps a
+            # hand-rolled version of this green.
+            caught = tlp.view_check(bent, cols, pred, outer, True)
+            _, got = tlp.view_results(bent, cols, pred, outer, True)
+        except sqlite3.Error:
+            continue
+        tested += 1
+        shipped += bool(caught)
+        named = dict(got)
+        pairwise += named["view"] != named["CTE"]
+    return shipped, pairwise, tested
+
+
+for kind in ("distinct-dup", "view-skew"):
+    s, p, t = flat_only_detection(kind)
+    MEASURED["against the flat query on %s" % kind] = s
+    MEASURED["view-vs-CTE on %s" % kind] = p
+    MEASURED["flat-only cases"] = t
+    if s > t // 5 and p == 0:
+        ok("%s is caught %d times in %d against the flat query, and %d "
+           "times by comparing the view against the CTE" % (kind, s, t, p))
+    else:
+        no("%s does not separate the two comparisons" % kind,
+           "%d shipped, %d pairwise, in %d" % (s, p, t))
+
+
+def plan_diffs(n=200, seed=0, distinct=False):
+    """How often each named form reaches a plan the flat query does not."""
+    rnd = random.Random(seed)
+    db = tlp.connect()
+    counts = dict.fromkeys(("view", "CTE", "materialized"), 0)
+    tested = 0
+    for _ in range(n):
+        _, cols, _ = tlp.build(db, rnd, 8, 0.25)
+        db.execute("CREATE INDEX IF NOT EXISTS i0 ON t(%s)" % cols[0][0])
+        pred = tlp.gen_predicate(rnd, cols, 2)
+        outer = tlp.gen_atom(rnd, cols)
+        try:
+            tlp.view_results(db, cols, pred, outer, distinct)
+            moved = dict(tlp.view_plans(db, cols, pred, outer, distinct))
+        except sqlite3.Error:
+            continue
+        tested += 1
+        for k in counts:
+            counts[k] += moved[k]
+    return counts, tested
+
+
+# A rename that changes nothing about the plan is a query compared against
+# itself, which is this relation's vacuity question. SQLite flattens a
+# view over a plain filter into exactly the plan of the flat query, so on
+# that shape the view and the plain CTE are worth nothing at all -- and
+# that is a measurement, not a reading of the documentation.
+plain, nplain = plan_diffs()
+dedup, ndedup = plan_diffs(distinct=True)
+MEASURED["plan cases"] = nplain
+for form in ("view", "CTE", "materialized"):
+    MEASURED["plan %s plain" % form] = plain[form]
+    MEASURED["plan %s distinct" % form] = dedup[form]
+check("the plan measurement ran the same number of cases both ways",
+      ndedup, nplain)
+check("a view over a plain filter is flattened into the flat query's plan",
+      (plain["view"], plain["CTE"]), (0, 0))
+ok("...so the plain CTE is worth nothing on that shape either, and "
+   "MATERIALIZED is the form that always reaches a second plan (%d of %d)"
+   % (plain["materialized"], nplain)) if plain["materialized"] == nplain else \
+    no("MATERIALIZED does not always change the plan",
+       "%d of %d" % (plain["materialized"], nplain))
+ok("DISTINCT in the view body blocks the flattening (view %d of %d, "
+   "CTE %d of %d)" % (dedup["view"], ndedup, dedup["CTE"], ndedup)) \
+    if dedup["view"] > 0.9 * ndedup and dedup["CTE"] > 0.9 * ndedup else \
+    no("DISTINCT does not block the flattening",
+       "view %d, CTE %d, of %d" % (dedup["view"], dedup["CTE"], ndedup))
+
+# And the hint is doing the work rather than being decoration: SQLite's own
+# plan says MATERIALIZE for one form and not for the other.
+probe = tlp.connect()
+probe.execute("CREATE TABLE t (c0 INTEGER)")
+_, _, named = tlp.view_queries([("c0", "INTEGER")], "c0 > 1", "c0 < 4")
+plans = {}
+for name, sql in named:
+    if name == "view":
+        continue
+    plans[name] = " ".join(r[3] for r in
+                           probe.execute("EXPLAIN QUERY PLAN " + sql))
+check("MATERIALIZED materialises, and the plain CTE does not",
+      ("MATERIALIZE" in plans["materialized"],
+       "MATERIALIZE" in plans["CTE"]), (True, False))
+
 # ------------------------------------------- the README against this run
 #
 # Every false-alarm count in README.md is a number somebody copied out of a
@@ -923,6 +1131,24 @@ expected = [
     "| `IS NOT TRUE` alongside an `IS NULL` arm | %d |"
     % MEASURED["IS NOT TRUE alongside an IS NULL arm"],
     "| a duplicated TRUE arm | %d |" % MEASURED["a duplicated TRUE arm"],
+    "| `(p) OR (q)` | %d |" % MEASURED["`OR` for `AND`"],
+    "| `(p)` alone, the outer filter dropped | %d |"
+    % MEASURED["the outer filter dropped"],
+    "| `CREATE VIEW` | %d of %d | %d of %d |"
+    % (MEASURED["plan view plain"], MEASURED["plan cases"],
+       MEASURED["plan view distinct"], MEASURED["plan cases"]),
+    "| `WITH` | %d of %d | %d of %d |"
+    % (MEASURED["plan CTE plain"], MEASURED["plan cases"],
+       MEASURED["plan CTE distinct"], MEASURED["plan cases"]),
+    "| `WITH ... AS MATERIALIZED` | %d of %d | %d of %d |"
+    % (MEASURED["plan materialized plain"], MEASURED["plan cases"],
+       MEASURED["plan materialized distinct"], MEASURED["plan cases"]),
+    "| the flat query alone (`distinct-dup`) | %d of %d | %d |"
+    % (MEASURED["against the flat query on distinct-dup"],
+       MEASURED["flat-only cases"], MEASURED["view-vs-CTE on distinct-dup"]),
+    "| every named form (`view-skew`) | %d of %d | %d |"
+    % (MEASURED["against the flat query on view-skew"],
+       MEASURED["flat-only cases"], MEASURED["view-vs-CTE on view-skew"]),
 ]
 check("every false-alarm count in README.md is the one measured here",
       [row for row in expected if row not in readme], [])
@@ -1247,7 +1473,8 @@ ok("pattern matching reaches the shared predicate generator (%d of 400)"
 
 def detection_matrix(n=60, seed=0):
     """rows = planted bug, columns = relation, values = hit count."""
-    names = ("TLP", "NoREC", "agg", "DISTINCT", "GROUP", "HAVING", "LIKE")
+    names = ("TLP", "NoREC", "agg", "DISTINCT", "GROUP", "HAVING", "LIKE",
+             "VIEW")
     matrix = {}
     for kind in tlp.BUG_KINDS:
         rnd = random.Random(seed)
@@ -1258,6 +1485,8 @@ def detection_matrix(n=60, seed=0):
             col = cols[0][0]
             pred = tlp.gen_predicate(rnd, cols, 2)
             hv = tlp.gen_having(rnd, cols, 2)
+            outer = tlp.gen_atom(rnd, cols)
+            dedup = rnd.random() < 0.5
             ints = [c for c, ty in cols if ty == "INTEGER"]
             text = [c for c, ty in cols if ty == "TEXT"]
             bent = tlp.Corrupt(real, kind)
@@ -1265,7 +1494,9 @@ def detection_matrix(n=60, seed=0):
                       ("NoREC", lambda: tlp.norec_check(bent, pred)),
                       ("DISTINCT", lambda: tlp.distinct_check(bent, pred, col)),
                       ("GROUP", lambda: tlp.group_check(bent, pred, col)),
-                      ("HAVING", lambda: tlp.having_check(bent, hv, col))]
+                      ("HAVING", lambda: tlp.having_check(bent, hv, col)),
+                      ("VIEW", lambda: tlp.view_check(bent, cols, pred, outer,
+                                                      dedup))]
             if ints:
                 probes.append(("agg",
                                lambda: tlp.agg_check(bent, pred, "SUM", ints[0])))
@@ -1297,6 +1528,12 @@ check("no relation's detection is dominated by another's", dominated, [])
 # nothing at all.
 useless = [a for a in names if not any(matrix[k][a] for k in matrix)]
 check("every relation catches at least one planted bug", useless, [])
+
+# The bug that keeps the view relation out of the dominated list, named, so
+# that deleting it is visibly what turns the check above red rather than
+# something mysterious. Nothing else here reads a view or a CTE.
+check("view-skew is caught by the view relation and by nothing else",
+      [a for a in names if matrix["view-skew"][a]], ["VIEW"])
 
 # And every planted bug must be caught, which is the property `selftest`
 # exits non-zero on.

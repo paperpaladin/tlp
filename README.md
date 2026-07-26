@@ -9,18 +9,19 @@ $ python3 tlp.py tlp --n 500
 TLP: 500 queries, 0 disagreements, 0 skipped, 150 genuinely three-valued (30%)
 
 $ python3 tlp.py selftest
-planted bug           TLP  NoREC   agg  DISTINCT  GROUP  HAVING   LIKE
-drop-row             100%     0%    0%        0%    79%     79%     0%
-duplicate-row        100%     0%    0%        0%   100%    100%     0%
-null-only             24%     0%    0%        0%    24%     31%     0%
-count-off-by-one       0%   100%    0%        0%     0%      0%     0%
-aggregate-skew         0%     0%   85%        0%     0%      0%     0%
-distinct-dup           0%     0%    0%      100%     0%      0%     0%
-group-skew             0%     0%    0%        0%   100%    100%     0%
-setop-drop-row       100%     0%    0%       79%    79%     79%     0%
-having-drop-group      0%     0%    0%        0%     0%     97%     0%
-glob-skew              0%     0%    0%        0%     0%      0%    27%
-groupfilter-skew       0%     0%    0%        0%   100%      0%     0%
+planted bug           TLP  NoREC   agg  DISTINCT  GROUP  HAVING   LIKE   VIEW
+drop-row             100%     0%    0%        0%    76%     76%     0%     0%
+duplicate-row        100%     0%    0%        0%   100%    100%     0%     0%
+null-only             21%     0%    0%        0%    21%     32%     0%     0%
+count-off-by-one       0%   100%    0%        0%     0%      0%     0%     0%
+aggregate-skew         0%     0%   88%        0%     0%      0%     0%     0%
+distinct-dup           0%     0%    0%      100%     0%      0%     0%    19%
+group-skew             0%     0%    0%        0%   100%    100%     0%     0%
+setop-drop-row       100%     0%    0%       76%    76%     76%     0%     0%
+having-drop-group      0%     0%    0%        0%     0%     98%     0%     0%
+glob-skew              0%     0%    0%        0%     0%      0%    21%     0%
+groupfilter-skew       0%     0%    0%        0%   100%      0%     0%     0%
+view-skew              0%     0%    0%        0%     0%      0%     0%    39%
 
 every planted bug is caught by at least one oracle
 ```
@@ -100,13 +101,15 @@ was built for and **nothing else**:
   invisible to all of them.
 - None of the five writes a `HAVING` clause, so a group wrongly filtered
   out by one is invisible to all of them.
+- None of the six reads a view or a CTE, so a query that answers one way
+  flat and another way through a name is invisible to all of them.
 
 ### And the matrix itself was missing four relations
 
-The check above covers the seven single-table relations. It did not cover
-the four join relations, while the module docstring claimed *"eleven
-relations, and none of them is redundant: for every pair there is a planted
-bug one catches and the other does not"*.
+The check above covers the single-table relations, eight of them now. It
+did not cover the four join relations, while the module docstring claimed
+*"eleven relations, and none of them is redundant: for every pair there is
+a planted bug one catches and the other does not"*.
 
 That was false. Run over the join half, the same algorithm reports
 `join3 is dominated by inner`: the three-table `ON`-partitioning
@@ -143,8 +146,8 @@ on the available evidence, carrying it was pointless.
 
 `groupfilter-skew` is that bug: a per-partition grouped count that is
 wrong. Grouping gone wrong underneath a filter. `GROUP BY` catches it
-100% of the time and `HAVING` 0%, and the last row of the table above is
-the two relations finally being told apart.
+100% of the time and `HAVING` 0%, which is the two relations finally being
+told apart.
 
 The suite now checks the whole claim pairwise instead of in prose. For
 every ordered pair of relations there must be some planted bug the first
@@ -161,8 +164,8 @@ planted bug's trigger, not of the relation.
 
 Separating the two explanations costs one more planted bug. `setop-drop-row`
 is the same lost row fired on any set operation, and the `DISTINCT` column
-moves to 79%, so the relation sees lost rows fine, and it was the bug
-that could not see the relation. The last row of the table exists only to
+moves to 76%, so the relation sees lost rows fine, and it was the bug
+that could not see the relation. That row of the table exists only to
 answer that question, and without it the table would be quietly overclaiming.
 
 ### The composition rules are load-bearing
@@ -556,6 +559,117 @@ moved every measured number in this file slightly. The README-consistency
 check in the suite earned its place right there. It went red on the
 composition tables the moment the generator changed.
 
+## A view and a CTE, expressing the same query
+
+Every relation above compares two queries over base tables. A view is the
+same query wearing a name, and SQLite either flattens it into the outer
+query or materialises it, so a rename is the cheapest second plan available
+here and it needs no second engine.
+
+One logical query, four renderings:
+
+```sql
+    SELECT c0, c1 FROM t WHERE (p) AND (q)                     -- flat
+
+    CREATE VIEW v AS SELECT c0, c1 FROM t WHERE (p);
+    SELECT * FROM v WHERE (q)                                  -- view
+
+    WITH w AS (SELECT c0, c1 FROM t WHERE (p))
+    SELECT * FROM w WHERE (q)                                  -- CTE
+
+    WITH w AS MATERIALIZED (...) SELECT * FROM w WHERE (q)      -- forced
+```
+
+The flat form is the reference, because it is SQLite answering the query
+with no nesting at all. Filtering by `q` what `p` has already kept is the
+rows where both are TRUE, which is the conjunction. The filter outside the
+view is what makes the shape worth issuing: with nothing out there, no
+predicate has to be pushed anywhere and there is no decision to get wrong.
+
+```
+$ python3 tlp.py view --n 500
+view and CTE: 500 queries, 0 disagreements, 0 skipped, 493 rows compared,
+              243 where the view was not flattened (49%)
+```
+
+Rows compared is in that line because an empty result satisfies any
+equality. The flat form and the view form of a query that returns nothing
+agree whatever either of them does, so a run whose comparisons were all
+empty would print a long row of agreements and be worth none of them. Over
+the suite's 200 queries the comparison covers 226 rows, with 90 of the
+queries returning at least one.
+
+### Each named form is compared against the flat query, never against the other
+
+Building a view and a CTE and comparing them to each other would prove
+nothing about either. They are two wrappers around one query, so a defect
+in the flat path leaves them equal and agreeing, and the comparison reports
+nothing while looking exactly as busy.
+
+That is measured with two planted bugs pointed at opposite paths.
+`distinct-dup` duplicates a row in any query beginning `SELECT DISTINCT`,
+which with a dedup in the view body is the flat form and nothing else.
+`view-skew` is its mirror, a row lost from every form that reads a name:
+
+| defect planted in | caught against the flat query | caught by view against CTE |
+|---|---|---|
+| the flat query alone (`distinct-dup`) | 81 of 200 | 0 |
+| every named form (`view-skew`) | 81 of 200 | 0 |
+
+The same 81 twice over, because both bugs fire exactly when the result is
+non-empty. The pairwise comparison sees neither: in the first case both
+wrappers are clean, in the second both are wrong in the same direction.
+
+### The rename changes no plan on its own
+
+A relation that reaches the same plan twice has compared a query against
+itself, which is the hazard the reordering relation has. Here it is not
+hypothetical, and the numbers are from `EXPLAIN QUERY PLAN` rather than
+from the documentation:
+
+| rendering | plain view body | with `DISTINCT` |
+|---|---|---|
+| `CREATE VIEW` | 0 of 200 | 200 of 200 |
+| `WITH` | 0 of 200 | 200 of 200 |
+| `WITH ... AS MATERIALIZED` | 200 of 200 | 200 of 200 |
+
+A view over a plain filter is flattened into exactly the plan of the flat
+query, every time, and so is a plain CTE. On that shape both are a query
+compared against itself, and the relation would have printed 500
+agreements a run while testing one plan. `DISTINCT` in the view body blocks
+the flattening, and `MATERIALIZED` blocks it unconditionally, which is why
+the generator puts a dedup in half the view bodies and why the shipped
+report says how often the view survived as a view.
+
+`NOT MATERIALIZED` on the plain CTE is an equivalent rewrite here and is
+recorded as one: SQLite's plan for a CTE referenced once is already the
+flattened one, so asking for it explicitly changes nothing. That mutation
+survives the suite.
+
+### The conjunction is load-bearing
+
+Against a database that is behaving correctly:
+
+| the flat query's rule | false alarms in 200 |
+|---|---|
+| **`(p) AND (q)`** | **0** |
+| `(p) OR (q)` | 176 |
+| `(p)` alone, the outer filter dropped | 116 |
+
+`OR` keeps rows the view never passed on; dropping the outer filter keeps
+rows it filtered out. Neither is subtle, and both are in the suite because
+the rule is the relation's whole claim to be comparing one query with
+itself.
+
+One mutation survived everything else and needed a check of its own. Built
+from the flat query rather than from the inner one, the view still agrees
+row for row, because applying the outer filter twice removes nothing the
+first application left. The rows are identical, the false-alarm count stays
+at 0, and the push-down this relation exists to test is no longer in the
+query. So the view's body is read back directly and required to equal the
+inner query, over 200 cases in which the outer filter removes a row from
+126.
+
 ## Shrinking a case to something a human will read
 
 A found case is a schema, ten rows and a predicate like
@@ -672,8 +786,11 @@ No other engines. There is no DuckDB or PostgreSQL on this machine. A
 metamorphic oracle was chosen for that reason and not as a concession to it,
 not a limitation of it.
 
-No floating point, no collation-dependent operators, no triggers, views,
-foreign keys, virtual tables or window functions. `LIKE` is in, but only
+No floating point, no collation-dependent operators, no triggers,
+foreign keys, virtual tables or window functions. A view is in, but only
+the one shape the view relation builds: one filter inside it, one atom
+outside it, and an optional `DISTINCT`. No view over a join, no view over
+an aggregate, no view selecting from another view. `LIKE` is in, but only
 with its case folding pinned off and only over a five-character pattern
 alphabet; `ESCAPE` clauses, character classes and `LIKE` on non-text
 columns are all absent. Row
@@ -732,7 +849,7 @@ equivalent mutant, not a hole.
 
 ```
 $ make test
-130 passed, 0 failed
+145 passed, 0 failed
 ```
 
 No pytest, no network, no dependencies. `sqlite3` is in the standard

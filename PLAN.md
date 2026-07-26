@@ -18,6 +18,7 @@ tlp.py distinct [--n N] [--seed S]   partition a DISTINCT
 tlp.py group   [--n N] [--seed S]    partition a GROUP BY
 tlp.py having  [--n N] [--seed S]    partition a HAVING clause
 tlp.py like    [--n N] [--seed S]    LIKE against GLOB
+tlp.py view    [--n N] [--seed S]    a view and a CTE against the flat query
 tlp.py selftest                      plant bugs, check the oracles notice
 tlp.py joinselftest                  the same, for the join relations
 tlp.py reduce  [--bug K]             shrink a found case to a minimal one
@@ -103,8 +104,10 @@ what was there. A run that reports nothing is the expected outcome; what
 this has to prove is that it WOULD report something, the thing the
 planted-defect checks are for.
 
-Schema features beyond what the generator emits: no triggers, no views, no
-foreign keys, no virtual tables, no window functions.
+Schema features beyond what the generator emits: no triggers, no foreign
+keys, no virtual tables, no window functions. Views are in as of item 13,
+in one shape only: a filter inside, an atom outside, an optional DISTINCT.
+Not over a join, not over an aggregate, not over another view.
 
 ## Commit sequence
 
@@ -466,7 +469,7 @@ foreign keys, no virtual tables, no window functions.
             on the composition tables instead of letting the document
             drift. Every table has been re-measured.
 
-- [ ] 13 a view, and a CTE, expressing the same query
+- [x] 13 a view, and a CTE, expressing the same query
       why: every relation here compares two queries over base tables. A
            view is the same query wearing a name, and SQLite either flattens
            it into the outer query or materialises it, two different plans
@@ -474,6 +477,47 @@ foreign keys, no virtual tables, no window functions.
            to get a second plan for one relation without a second engine,
            and it is the shape the reordering relation had to fake with
            CROSS JOIN.
+      done: one logical query in four renderings, with the FLAT one as the
+           reference because it is SQLite answering with no nesting at all:
+
+               SELECT c0, c1 FROM t WHERE (p) AND (q)
+               CREATE VIEW v AS SELECT c0, c1 FROM t WHERE (p);
+                   SELECT * FROM v WHERE (q)
+               WITH w AS (SELECT c0, c1 FROM t WHERE (p))
+                   SELECT * FROM w WHERE (q)
+               WITH w AS MATERIALIZED (...) SELECT * FROM w WHERE (q)
+
+           Each named form is compared against the flat query and never
+           against another named form. Comparing the view against the CTE
+           would prove nothing about either: both are wrappers around one
+           query, so a defect on the flat path leaves them equal.
+      proves: 0 disagreements over 500 queries and 493 rows compared, with
+           the rows reported because an empty result satisfies any
+           equality. view-skew is caught 39% by this relation and 0% by
+           the seven others.
+           The two comparisons are separated by two planted bugs pointed
+           at opposite paths: distinct-dup corrupts the flat query alone
+           and view-skew every named form, and each is caught 81 times in
+           200 against the flat query and 0 times by view-against-CTE.
+           The flat query's rule is load-bearing: OR for AND raises 176
+           false alarms in 200, and dropping the outer filter 116.
+      found: the rename is worth nothing on its own, and this is the
+           finding that changed the shape of the relation. SQLite flattens
+           a view over a plain filter into exactly the plan of the flat
+           query, 0 of 200 differing, and so does a plain CTE. The first
+           version would have printed 500 agreements a run while issuing
+           one plan. DISTINCT in the view body blocks the flattening, 200
+           of 200, and MATERIALIZED blocks it unconditionally, so half the
+           generated view bodies dedupe and the report says how often the
+           view survived as a view: 49%.
+      note: two mutation results worth keeping. Building the view from the
+           FLAT query instead of the inner one survived every check here,
+           because applying the outer filter twice removes nothing, so the
+           rows agree while the push-down under test is no longer in the
+           query; the view's body is now read back and required to equal
+           the inner query. And NOT MATERIALIZED on the plain CTE is an
+           equivalent rewrite, since SQLite's plan for a CTE referenced
+           once is already the flattened one.
 - [ ] 14 HAVING over SUM, MIN and MAX, and a second grouping column
       why: item 10 partitions HAVING only for COUNT(*) on one grouping
            column, the easiest case: COUNT(*) is never NULL and
