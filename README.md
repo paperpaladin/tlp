@@ -10,18 +10,19 @@ TLP: 500 queries, 0 disagreements, 0 skipped, 150 genuinely three-valued (30%)
 
 $ python3 tlp.py selftest
 planted bug           TLP  NoREC   agg  DISTINCT  GROUP  HAVING   LIKE   VIEW
-drop-row             100%     0%    0%        0%    76%     76%     0%     0%
+drop-row             100%     0%    0%        0%    73%     90%     0%     0%
 duplicate-row        100%     0%    0%        0%   100%    100%     0%     0%
-null-only             21%     0%    0%        0%    21%     32%     0%     0%
+null-only             23%     0%    0%        0%    22%     29%     0%     0%
 count-off-by-one       0%   100%    0%        0%     0%      0%     0%     0%
 aggregate-skew         0%     0%   88%        0%     0%      0%     0%     0%
-distinct-dup           0%     0%    0%      100%     0%      0%     0%    19%
-group-skew             0%     0%    0%        0%   100%    100%     0%     0%
-setop-drop-row       100%     0%    0%       76%    76%     76%     0%     0%
-having-drop-group      0%     0%    0%        0%     0%     98%     0%     0%
-glob-skew              0%     0%    0%        0%     0%      0%    21%     0%
+distinct-dup           0%     0%    0%      100%     0%      0%     0%    21%
+group-skew             0%     0%    0%        0%   100%     81%     0%     0%
+setop-drop-row       100%     0%    0%       73%    73%     90%     0%     0%
+having-drop-group      0%     0%    0%        0%     0%     99%     0%     0%
+glob-skew              0%     0%    0%        0%     0%      0%    25%     0%
 groupfilter-skew       0%     0%    0%        0%   100%      0%     0%     0%
-view-skew              0%     0%    0%        0%     0%      0%     0%    39%
+view-skew              0%     0%    0%        0%     0%      0%     0%    38%
+having-agg-skew        0%     0%    0%        0%     0%     29%     0%     0%
 
 every planted bug is caught by at least one oracle
 ```
@@ -164,7 +165,7 @@ planted bug's trigger, not of the relation.
 
 Separating the two explanations costs one more planted bug. `setop-drop-row`
 is the same lost row fired on any set operation, and the `DISTINCT` column
-moves to 76%, so the relation sees lost rows fine, and it was the bug
+moves to 73%, so the relation sees lost rows fine, and it was the bug
 that could not see the relation. That row of the table exists only to
 answer that question, and without it the table would be quietly overclaiming.
 
@@ -274,20 +275,22 @@ Plain `UNION ALL`, no re-aggregation. The `GROUP BY` relation needed
 `SUM(n)` over its arms because partitioning a `WHERE` clause cuts every
 group into three pieces that have to be added back. Partitioning a `HAVING`
 clause cuts no group at all: each one arrives whole in exactly one arm,
-already counted.
+already counted. `g` is one column or two, and the aggregate in the select
+list is `COUNT(*)`, `SUM`, `MIN` or `MAX`, drawn per case; neither choice
+changes the rule, which is the subject of a section below.
 
 ### So what is load-bearing moves
 
 For `DISTINCT` and `GROUP BY` the composition operator was the trap. Here
 it is not a trap at all, and the traps are all in the arms:
 
-| variation | false alarms in 200 |
-|---|---|
-| as shipped | **0** |
-| `UNION` instead of `UNION ALL` | **0**, an equivalent rewrite |
-| drop the `IS NULL` arm | 88 |
-| `IS NOT TRUE` alongside an `IS NULL` arm | 88 |
-| a duplicated TRUE arm | 136 |
+| variation | false alarms in 200 | the same on two columns with a `SUM`, in 173 |
+|---|---|---|
+| as shipped | **0** | **0** |
+| `UNION` instead of `UNION ALL` | **0**, an equivalent rewrite | |
+| drop the `IS NULL` arm | 88 | 104 |
+| `IS NOT TRUE` alongside an `IS NULL` arm | 88 | 104 |
+| a duplicated TRUE arm | 136 | 132 |
 
 `UNION` costs nothing here because each arm emits at most one row per group
 key and the key is unique within a group, so the recombined query never
@@ -319,10 +322,11 @@ differently. That claim is not supported by anything measured here:
 |---|---|---|
 | `drop-row` | 100% | 100% |
 | `duplicate-row` | 100% | 100% |
-| `null-only` | 21% | 21% |
+| `null-only` | 20% | 20% |
 | `setop-drop-row` | 100% | 100% |
 
-Identical. Which is a finding about the **planted bugs**. The relations
+Identical, and measured in the suite rather than by hand, which it was
+until item 14. Which is a finding about the **planted bugs**. The relations
 are fine: these wrappers corrupt result sets, not query plans, so they
 cannot tell two sound relations apart no matter how differently a real
 engine would execute them. That is the ceiling of this whole selftest
@@ -356,6 +360,80 @@ than fixable: an eight-row table has about **3.9 groups**, and splitting
 four things three ways without leaving an arm empty is simply harder than
 splitting eight. The right comparison for this number is not the row-level
 one.
+
+### A second grouping column, and a select list that needs no rule
+
+Item 10 shipped this relation for `COUNT(*)` on one grouping column, the
+easiest case on both halves. Widening it goes two ways, and the difficulty
+was not where the plan said it would be.
+
+The select list reaches no composition rule at all. `HAVING` splits groups
+and never cuts one, so each group arrives whole in a single arm with its
+aggregate already computed, and nothing is recombined for a rule to be
+wrong about. `AVG` is the proof: it is the one aggregate the table at the
+top of this file has no entry for, because the average of three averages is
+not the average, and here it is carried with no more care than `COUNT(*)`:
+
+| select list | false alarms, one column | two columns |
+|---|---|---|
+| `COUNT(*)` | 0 / 200 | 0 / 200 |
+| `SUM` | 0 / 173 | 0 / 173 |
+| `MIN` | 0 / 173 | 0 / 173 |
+| `MAX` | 0 / 173 | 0 / 173 |
+| `AVG` | 0 / 173 | 0 / 173 |
+
+173 rather than 200 because those four need an integer column and the
+generator does not always produce one.
+
+The second grouping column is the half that moved a number. The key becomes
+a tuple with its own NULL rule: `GROUP BY` puts `(NULL, NULL)` and
+`(NULL, NULL)` in one group while keeping `(NULL, 1)` and `(1, NULL)`
+apart, where `=` would call no pair of them equal. The suite asks SQLite
+that directly, the same way it asks about the three operators the `DISTINCT`
+relation leans on.
+
+And the 3.9 groups above turn out to be a lever rather than a ceiling:
+
+| grouping key | groups per table | three-valued |
+|---|---|---|
+| one column | 3.9 | 17% |
+| two columns | 6.5 | 27% |
+
+Splitting six things three ways without emptying an arm is easier than
+splitting four, so a wider key is the better generator for this relation,
+and half the shipped cases use one. I had expected the opposite, on the
+reasoning that smaller groups are more often all-NULL.
+
+The arms stay load-bearing in the widened shape, which is the second column
+of the table in the section above. Nothing about the widening makes the
+three-way split matter less.
+
+What the wider select list bought is a defect class that was invisible
+before. A group whose aggregate is wrong while its count is right passes
+every relation here: the rows all reassemble, the counts all agree, the
+whole-table aggregate is right, and nothing else writes a `HAVING` clause.
+`having-agg-skew` is that defect, one group's `SUM`, `MIN` or `MAX`
+arriving one too high out of a filtered query:
+
+| select list | `having-agg-skew` caught |
+|---|---|
+| `COUNT(*)` | 0 of 173 |
+| `SUM` | 107 of 173 |
+| `MIN` | 107 of 173 |
+| `MAX` | 107 of 173 |
+
+The same count three times over, because the planted bug fires on the
+select list rather than on which aggregate is in it. The zero in the first
+row is the point: that is the shape item 10 shipped, and it cannot see this
+at all.
+
+Finding the defect also found one in an older planted bug. `group-skew`
+added 1 to column 1 of a grouped result, which was the count for as long as
+every grouped query here was `(key, COUNT(*))` on one column. A two-column
+key makes column 1 part of the key, so it incremented a grouping value
+instead, and against a TEXT one it raised a `TypeError` out of the middle
+of a selftest run rather than reporting anything at all. It corrupts the
+last column now.
 
 ## Partitioning a join's ON clause
 
@@ -804,7 +882,9 @@ no surviving part of the predicate mentions it. The worked example above
 shows this happening.
 
 `GROUP BY` is partitioned only for `COUNT(*)`, and only on a single
-grouping column.
+grouping column. `HAVING` takes one or two grouping columns and carries
+`COUNT(*)`, `SUM`, `MIN` or `MAX`, and no more than two: a three-column key
+is not generated, and neither relation groups on an expression.
 
 The planted bugs cannot distinguish two sound relations. They wrap the
 connection and corrupt result sets, so they model a wrong answer but never
@@ -849,7 +929,7 @@ equivalent mutant, not a hole.
 
 ```
 $ make test
-145 passed, 0 failed
+173 passed, 0 failed
 ```
 
 No pytest, no network, no dependencies. `sqlite3` is in the standard

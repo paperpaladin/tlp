@@ -1300,30 +1300,63 @@ def gen_having(rnd, cols, depth=2):
     return render(gen_tree(rnd, cols, depth, gen_having_atom))
 
 
-def having_group_sizes(db, pred, col):
+def gen_having_shape(rnd, cols):
+    """A grouping key of one or two columns, and an aggregate to carry.
+
+    Item 10 shipped this relation for COUNT(*) on a single column, the
+    easiest case in both halves: COUNT(*) is never NULL, and one column
+    puts every NULL in the key into exactly one group. Two columns make
+    the key a tuple, where SQLite groups (NULL, NULL) with (NULL, NULL)
+    and apart from (NULL, 1), and SUM, MIN and MAX can each be NULL for a
+    group whose values all are.
+
+    Both are generated per case rather than fixed, so what ships is what
+    the selftest and the suite point at.
+    """
+    width = 2 if len(cols) > 1 and rnd.random() < 0.5 else 1
+    key = ", ".join(c for c, _ in rnd.sample(cols, width))
+    ints = [c for c, ty in cols if ty == "INTEGER"]
+    if ints and rnd.random() < 0.6:
+        agg = "%s(%s)" % (rnd.choice(["SUM", "MIN", "MAX"]), rnd.choice(ints))
+    else:
+        agg = "COUNT(*)"
+    return key, agg
+
+
+def having_group_sizes(db, pred, key):
     """How many GROUPS land in each of the three HAVING partitions."""
     n = lambda h: db.execute(
         "SELECT COUNT(*) FROM (SELECT %s FROM t GROUP BY %s HAVING %s)"
-        % (col, col, h)).fetchone()[0]
+        % (key, key, h)).fetchone()[0]
     return (n("(%s)" % pred), n("NOT (%s)" % pred), n("(%s) IS NULL" % pred))
 
 
 HAVING_ARMS = ("(%s)", "NOT (%s)", "(%s) IS NULL")
 
 
-def having_check(db, pred, col, combine="UNION ALL", arms=HAVING_ARMS):
+def having_check(db, pred, key, combine="UNION ALL", arms=HAVING_ARMS,
+                 agg="COUNT(*)"):
     """The grouped whole against the same groups split three ways.
+
+    `key` is one column or a comma-separated tuple of them, and `agg` is
+    the aggregate the select list carries. Neither changes the rule, and
+    that is the point of widening them: HAVING splits groups and never
+    cuts one, so each group arrives whole in exactly one arm with its
+    aggregate already computed, and nothing is ever recombined. The
+    composition table that SUM, COUNT, MIN and MAX need in aggregate TLP
+    is not reached here at all -- AVG included, the one aggregate that has
+    no entry in that table.
 
     `combine` and `arms` are parameters so the suite can put the wrong rule
     in and watch the relation go wrong. Their defaults are what ships, and
     the suite checks the defaults separately -- a parameterised test that
     always supplies the parameter stops testing what ships.
     """
-    whole = rows_of(db, "SELECT %s, COUNT(*) FROM t GROUP BY %s" % (col, col))
+    whole = rows_of(db, "SELECT %s, %s FROM t GROUP BY %s" % (key, agg, key))
     parts = rows_of(db,
                     (" %s " % combine).join(
-                        "SELECT %s, COUNT(*) FROM t GROUP BY %s HAVING %s"
-                        % (col, col, arm % pred) for arm in arms))
+                        "SELECT %s, %s FROM t GROUP BY %s HAVING %s"
+                        % (key, agg, key, arm % pred) for arm in arms))
     if whole == parts:
         return None
     return ("HAVING", len(whole), len(parts))
@@ -1340,17 +1373,19 @@ def cmd_having(args):
     db = connect()
     found = tested = skipped = interesting = 0
 
+    wide = 0
     for i in range(args.n):
         ddl, cols, rows = build(db, rnd, args.rows, args.null_rate)
-        col = cols[0][0]
+        key, agg = gen_having_shape(rnd, cols)
         pred = gen_having(rnd, cols, args.depth)
         try:
-            t, f, u = having_group_sizes(db, pred, col)
-            bad = having_check(db, pred, col)
+            t, f, u = having_group_sizes(db, pred, key)
+            bad = having_check(db, pred, key, agg=agg)
         except sqlite3.Error:
             skipped += 1
             continue
         tested += 1
+        wide += ("," in key)
         if t and f and u:
             interesting += 1
         if bad:
@@ -1360,15 +1395,19 @@ def cmd_having(args):
             for r in rows:
                 print("  INSERT INTO t VALUES (%s);"
                       % ", ".join(sql_literal(v) for v in r))
-            print("  GROUP BY %s HAVING %s" % (col, pred))
+            print("  SELECT %s, %s ... GROUP BY %s HAVING %s"
+                  % (key, agg, key, pred))
             print("  whole %r groups, recombined %r" % (bad[1], bad[2]))
             if found >= args.max_reports:
                 break
 
+    # The two-column count is reported because a wider key is a different
+    # shape, not a bigger one: it makes more groups and smaller ones, which
+    # moves the three-way split the line before it reports.
     print("HAVING: %d queries, %d disagreements, %d skipped, "
-          "%d split the groups three ways (%.0f%%)"
+          "%d split the groups three ways (%.0f%%), %d on a two-column key"
           % (tested, found, skipped, interesting,
-             100.0 * interesting / tested if tested else 0.0))
+             100.0 * interesting / tested if tested else 0.0, wide))
     return 1 if found else 0
 
 
@@ -1784,8 +1823,8 @@ class Corrupt:
         # alone: it is the only query here carrying GROUP BY and a WHERE
         # clause and no HAVING.
         if k == "groupfilter-skew" and "GROUP BY" in sql and "WHERE" in sql \
-                and "HAVING" not in sql and rows and rows[0][1] is not None:
-            return [(rows[0][0], rows[0][1] + 1)] + rows[1:]
+                and "HAVING" not in sql and rows and rows[0][-1] is not None:
+            return [rows[0][:-1] + (rows[0][-1] + 1,)] + rows[1:]
         # A group wrongly excluded by a HAVING filter. Only the HAVING
         # relation ever issues a HAVING clause, so only it can see this.
         #
@@ -1799,9 +1838,34 @@ class Corrupt:
         # One group counted one row too many. Invisible to everything that
         # does not group: the rows all reassemble, the whole-table count is
         # right, and the whole-table aggregate is right.
+        # The LAST column, not the second one. Those were the same thing
+        # while every grouped query here was (key, COUNT(*)) on one column.
+        # Item 14's two-column key made column 1 part of the KEY, so this
+        # added 1 to a grouping value -- and to a TEXT one it raised a
+        # TypeError out of the middle of a selftest run rather than
+        # reporting anything.
         if k == "group-skew" and "GROUP BY" in sql and "UNION" not in sql \
-                and rows and rows[0][1] is not None:
-            return [(rows[0][0], rows[0][1] + 1)] + rows[1:]
+                and rows and rows[0][-1] is not None:
+            return [rows[0][:-1] + (rows[0][-1] + 1,)] + rows[1:]
+        # A group's aggregate computed one too high, in a query whose
+        # groups were filtered. This is the defect item 14 bought: the
+        # relation partitioned HAVING for COUNT(*) alone until then, and a
+        # count that is right while a SUM over the same group is wrong was
+        # invisible to every relation here.
+        #
+        # The select list is read on its own, not the whole query, because
+        # a HAVING predicate is itself built from SUM, MIN and MAX terms --
+        # matching the whole text would fire on a COUNT(*) select list too
+        # and the bug would look like something the narrower relation could
+        # already see. Only the arms carry a HAVING, so the whole query is
+        # left alone and the two sides disagree.
+        if k == "having-agg-skew" and "HAVING" in sql:
+            head = sql.split(" FROM", 1)[0]
+            if any(a in head for a in ("SUM(", "MIN(", "MAX(")) and rows \
+                    and rows[-1][-1] is not None:
+                last = list(rows[-1])
+                last[-1] = last[-1] + 1
+                return rows[:-1] + [tuple(last)]
         # A row lost on the path through a NAME, and nowhere else. This is
         # the defect the view relation exists for: a query flattened into
         # or materialised out of a wrapper, answering differently from the
@@ -1821,7 +1885,7 @@ class Corrupt:
 BUG_KINDS = ["drop-row", "duplicate-row", "null-only", "count-off-by-one",
              "aggregate-skew", "distinct-dup", "group-skew",
              "setop-drop-row", "having-drop-group", "glob-skew",
-             "groupfilter-skew", "view-skew"]
+             "groupfilter-skew", "view-skew", "having-agg-skew"]
 
 
 JOIN_BUG_KINDS = ["join-drop-pair", "leftjoin-overpad", "reorder-skew",
@@ -1919,9 +1983,10 @@ def cmd_selftest(args):
             # HAVING needs its own predicate: a row-level one is not legal
             # in a HAVING clause, and feeding it one would skip every check
             # with an sqlite3.Error and print a column of zeros.
+            hkey, hagg = gen_having_shape(rnd, cols)
             try:
                 if having_check(bent, gen_having(rnd, cols, args.depth),
-                                cols[0][0]):
+                                hkey, agg=hagg):
                     hits["HAVING"] += 1
             except sqlite3.Error:
                 pass

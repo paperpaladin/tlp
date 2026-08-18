@@ -741,16 +741,27 @@ ok("...because of the trigger, not the relation: widened, it is caught (%d%%)"
 # composition OPERATOR was the trap. Here it is not a trap at all, and the
 # traps are all in the arms. Both halves of that are measured below.
 
-def having_alarms(n=200, seed=0, **kw):
-    """False alarms from the HAVING relation against a correct engine."""
+def having_alarms(n=200, seed=0, width=1, agg=None, **kw):
+    """False alarms from the HAVING relation against a correct engine.
+
+    `width` is how many columns the grouping key has and `agg` which
+    aggregate the select list carries. agg=None leaves having_check's own
+    default in place, so the shipped shape is what gets measured.
+    """
     rnd = random.Random(seed)
     db = sqlite3.connect(":memory:")
     a = t = 0
     for _ in range(n):
         _, cols, _ = tlp.build(db, rnd, 8, 0.40)
+        ints = [c for c, ty in cols if ty == "INTEGER"]
+        if len(cols) < width or (agg and not ints):
+            continue
+        key = ", ".join(c for c, _ in cols[:width])
+        if agg:
+            kw["agg"] = "%s(%s)" % (agg, ints[0])
         pred = tlp.gen_having(rnd, cols, 2)
         try:
-            bad = tlp.having_check(db, pred, cols[0][0], **kw)
+            bad = tlp.having_check(db, pred, key, **kw)
         except sqlite3.Error:
             continue
         t += 1
@@ -766,7 +777,7 @@ check("the HAVING relation as shipped raises no false alarm",
 # green when it was written the other way.
 check("...and its default arms and combiner are the correct ones",
       tlp.having_check.__defaults__,
-      ("UNION ALL", ("(%s)", "NOT (%s)", "(%s) IS NULL")))
+      ("UNION ALL", ("(%s)", "NOT (%s)", "(%s) IS NULL"), "COUNT(*)"))
 
 # The arms are load-bearing: they must cover every group exactly once.
 A = tlp.HAVING_ARMS
@@ -821,35 +832,222 @@ for _ in range(200):
 check("row-level TLP: the three-arm split holds", three, 0)
 check("row-level TLP: a two-arm IS NOT TRUE split holds just as well", two, 0)
 
+
+def arm_detection(kind, arms, n=200, seed=0):
+    """What the row-level relation catches with a given set of arms.
+
+    Both splits are sound, so the obvious next claim is that three arms is
+    the stronger test, since it issues a third query shape the engine may
+    plan differently. Nothing here supports that, and the table it produces
+    is a finding about the PLANTED BUGS rather than about the relations:
+    these wrappers corrupt result sets and not query plans, so they cannot
+    tell two sound relations apart however differently a real engine would
+    execute them. The numbers were measured by hand until item 14; nothing
+    in the suite reproduced them.
+    """
+    rnd = random.Random(seed)
+    real = tlp.connect()
+    hits = 0
+    for _ in range(n):
+        _, cols, _ = tlp.build(real, rnd, 8, 0.25)
+        pred = tlp.gen_predicate(rnd, cols, 2)
+        bent = tlp.Corrupt(real, kind)
+        sql = " UNION ALL ".join("SELECT * FROM t WHERE %s" % (arm % pred)
+                                 for arm in arms)
+        try:
+            hits += (tlp.rows_of(bent, "SELECT * FROM t")
+                     != tlp.rows_of(bent, sql))
+        except sqlite3.Error:
+            pass
+    return hits * 100 // n
+
+
+for kind in ("drop-row", "duplicate-row", "null-only", "setop-drop-row"):
+    r3 = arm_detection(kind, A)
+    r2 = arm_detection(kind, ("(%s)", "(%s) IS NOT TRUE"))
+    MEASURED["arms %s" % kind] = (r3, r2)
+    if r3 == r2:
+        ok("two arms catch %s exactly as often as three (%d%%)" % (kind, r3))
+    else:
+        no("the two splits differ on %s" % kind, "%d%% against %d%%" % (r3, r2))
+
 # The generator has to produce legal HAVING SQL, and a HAVING partition has
 # to actually split the groups. The floor is much lower than the row-level
 # 32% for a structural reason, measured here rather than excused: there are
 # only about four groups in an eight-row table, and splitting four things
 # three ways while leaving no arm empty is simply harder than splitting
 # eight.
-rnd = random.Random(0)
-db = sqlite3.connect(":memory:")
-split = tested = errors = 0
-groups = []
-for _ in range(400):
-    _, cols, _ = tlp.build(db, rnd, 8, 0.40)
-    col = cols[0][0]
-    pred = tlp.gen_having(rnd, cols, 2)
-    try:
-        t, f, u = tlp.having_group_sizes(db, pred, col)
-        groups.append(db.execute(
-            "SELECT COUNT(*) FROM (SELECT %s FROM t GROUP BY %s)"
-            % (col, col)).fetchone()[0])
-    except sqlite3.Error:
-        errors += 1
-        continue
-    tested += 1
-    split += bool(t and f and u)
+def having_split(width=1, n=400, seed=0):
+    """The three-way split rate, and how many groups there were to split."""
+    rnd = random.Random(seed)
+    db = sqlite3.connect(":memory:")
+    split = tested = errors = 0
+    groups = []
+    for _ in range(n):
+        _, cols, _ = tlp.build(db, rnd, 8, 0.40)
+        if len(cols) < width:
+            continue
+        key = ", ".join(c for c, _ in cols[:width])
+        pred = tlp.gen_having(rnd, cols, 2)
+        try:
+            t, f, u = tlp.having_group_sizes(db, pred, key)
+            groups.append(db.execute(
+                "SELECT COUNT(*) FROM (SELECT %s FROM t GROUP BY %s)"
+                % (key, key)).fetchone()[0])
+        except sqlite3.Error:
+            errors += 1
+            continue
+        tested += 1
+        split += bool(t and f and u)
+    return split * 100 // tested, sum(groups) / len(groups), tested, errors
+
+
+pct, pergroup, tested, errors = having_split()
 check("every generated HAVING predicate is legal SQL", errors, 0)
-pct = split * 100 // tested
 ok("HAVING predicates split the groups three ways %d%% of the time "
-   "(%.1f groups per table)" % (pct, sum(groups) / len(groups))) if pct >= 12 \
+   "(%.1f groups per table)" % (pct, pergroup)) if pct >= 12 \
     else no("HAVING predicates almost never split the groups", "%d%%" % pct)
+
+# A second grouping column is a different shape, not a bigger one. It makes
+# the key a tuple, which makes more groups and smaller ones, and the split
+# rate moves with the group count rather than against it: splitting six
+# things three ways without emptying an arm is easier than splitting four.
+# Measured because the first guess here was the wrong way round.
+wpct, wpergroup, wtested, werrors = having_split(width=2)
+MEASURED["one grouping column"] = (pct, round(pergroup, 1))
+MEASURED["two grouping columns"] = (wpct, round(wpergroup, 1))
+check("a two-column grouping key is legal SQL too", werrors, 0)
+ok("...and splits the groups three ways %d%% of the time, with %.1f groups "
+   "per table against %.1f" % (wpct, wpergroup, pergroup)) \
+    if wpct > pct and wpergroup > pergroup else \
+    no("a two-column key does not split the groups more often",
+       "%d%% over %.1f groups, against %d%% over %.1f"
+       % (wpct, wpergroup, pct, pergroup))
+
+# The tuple has its own NULL rule and the relation rests on it: GROUP BY
+# puts two all-NULL keys in one group while `=` would say the two keys are
+# not equal. Asked of SQLite directly rather than read out of the standard,
+# the same way the DISTINCT relation's three operators are.
+probe = sqlite3.connect(":memory:")
+probe.execute("CREATE TABLE g (a, b)")
+probe.executemany("INSERT INTO g VALUES (?, ?)",
+                  [(None, None), (None, None), (None, 1), (1, None)])
+check("GROUP BY a, b groups two all-NULL keys together",
+      probe.execute("SELECT COUNT(*) FROM g GROUP BY a, b "
+                    "HAVING a IS NULL AND b IS NULL").fetchall(), [(2,)])
+check("...and keeps (NULL, 1) and (1, NULL) apart",
+      probe.execute("SELECT COUNT(*) FROM "
+                    "(SELECT a, b FROM g GROUP BY a, b)").fetchone()[0], 3)
+
+# The widened shape has to be sound in every combination, and this is the
+# half of item 14 that did not go the way the plan said. A select-list
+# aggregate reaches no composition rule at all: HAVING splits groups and
+# never cuts one, so each group arrives whole in one arm with its
+# aggregate already computed and nothing is recombined. AVG is the proof
+# of it, since aggregate TLP has no rule for AVG and cannot carry it.
+for agg in (None, "SUM", "MIN", "MAX", "AVG"):
+    for width in (1, 2):
+        a, t = having_alarms(width=width, agg=agg)
+        MEASURED["sound %s %d" % (agg or "COUNT(*)", width)] = (a, t)
+        label = "%s on %d grouping column%s" % (agg or "COUNT(*)", width,
+                                                "" if width == 1 else "s")
+        if a == 0 and t > 100:
+            ok("HAVING: %s raises no false alarm in %d" % (label, t))
+        else:
+            no("HAVING: %s is not sound" % label, "%d alarms in %d" % (a, t))
+
+# And the arms are load-bearing in the widened shape too, not only in the
+# one they were measured in. Same three mutants, on a two-column key
+# carrying a SUM.
+for label, kw, floor in (
+        ("dropping the IS NULL arm", {"arms": A[:2]}, 0.3),
+        ("IS NOT TRUE alongside an IS NULL arm",
+         {"arms": ("(%s)", "(%s) IS NOT TRUE", "(%s) IS NULL")}, 0.3),
+        ("a duplicated TRUE arm",
+         {"arms": ("(%s)", "(%s)", "NOT (%s)", "(%s) IS NULL")}, 0.6)):
+    a, t = having_alarms(width=2, agg="SUM", **kw)
+    MEASURED["wide " + label] = a
+    if a >= floor * t:
+        ok("HAVING, two columns and a SUM: %s raises %d false alarms in %d"
+           % (label, a, t))
+    else:
+        no("HAVING, two columns and a SUM: %s is not load-bearing" % label,
+           "%d in %d" % (a, t))
+
+
+def having_shipped_alarms(n=300, seed=3):
+    """The shipped generator: a key and an aggregate drawn per case."""
+    rnd = random.Random(seed)
+    db = tlp.connect()
+    a = t = wide = 0
+    aggs = set()
+    for _ in range(n):
+        _, cols, _ = tlp.build(db, rnd, 8, 0.40)
+        key, agg = tlp.gen_having_shape(rnd, cols)
+        pred = tlp.gen_having(rnd, cols, 2)
+        try:
+            bad = tlp.having_check(db, pred, key, agg=agg)
+        except sqlite3.Error:
+            continue
+        t += 1
+        wide += ("," in key)
+        aggs.add(agg.split("(")[0])
+        a += bool(bad)
+    return a, t, wide, aggs
+
+
+a, t, wide, aggs = having_shipped_alarms()
+check("the shipped HAVING shapes raise no false alarm", a, 0)
+ok("...over %d queries, %d of them on a two-column key" % (t, wide)) \
+    if t > 200 and 50 < wide < t - 50 else \
+    no("the shipped HAVING shapes barely vary",
+       "%d of %d on two columns" % (wide, t))
+# A widening nothing draws from is a widening that is not wired in. Both
+# key widths above, and all four aggregates here.
+check("...and the shipped shapes reach every aggregate",
+      sorted(aggs), ["COUNT", "MAX", "MIN", "SUM"])
+
+
+def having_agg_detection(agg, n=200, seed=0, width=1):
+    """How often the relation notices a group's aggregate being wrong."""
+    rnd = random.Random(seed)
+    real = tlp.connect()
+    hits = tested = 0
+    for _ in range(n):
+        _, cols, _ = tlp.build(real, rnd, 8, 0.40)
+        ints = [c for c, ty in cols if ty == "INTEGER"]
+        if not ints or len(cols) < width:
+            continue
+        key = ", ".join(c for c, _ in cols[:width])
+        pred = tlp.gen_having(rnd, cols, 2)
+        bent = tlp.Corrupt(real, "having-agg-skew")
+        kw = {"agg": "%s(%s)" % (agg, ints[0])} if agg else {}
+        try:
+            bad = tlp.having_check(bent, pred, key, **kw)
+        except sqlite3.Error:
+            continue
+        tested += 1
+        hits += bool(bad)
+    return hits, tested
+
+
+# And this is what the widening bought, rather than soundness over a wider
+# shape. A group whose aggregate is wrong while its count is right was
+# invisible to everything here: the COUNT(*) select list item 10 shipped
+# cannot see it, and nothing else writes a HAVING clause at all.
+narrow_hits, narrow_t = having_agg_detection(None)
+for agg in ("SUM", "MIN", "MAX"):
+    hits, tested = having_agg_detection(agg)
+    MEASURED["agg-skew seen by %s" % agg] = (hits, tested)
+    if hits > tested // 5:
+        ok("having-agg-skew is caught %d times in %d with a %s in the select "
+           "list" % (hits, tested, agg))
+    else:
+        no("having-agg-skew is not caught with a %s in the select list" % agg,
+           "%d of %d" % (hits, tested))
+MEASURED["agg-skew seen by COUNT(*)"] = (narrow_hits, narrow_t)
+check("...and 0 times by the COUNT(*) shape item 10 shipped",
+      narrow_hits, 0)
 
 
 def having_detection(kind, n=120, seed=0):
@@ -863,12 +1061,14 @@ def having_detection(kind, n=120, seed=0):
         bent = tlp.Corrupt(real, kind)
         pred = tlp.gen_predicate(rnd, cols, 2)
         hv = tlp.gen_having(rnd, cols, 2)
+        hkey, hagg = tlp.gen_having_shape(rnd, cols)
         ints = [c for c, ty in cols if ty == "INTEGER"]
         probes = [("TLP", lambda: tlp.tlp_check(bent, pred)),
                   ("NoREC", lambda: tlp.norec_check(bent, pred)),
                   ("DISTINCT", lambda: tlp.distinct_check(bent, pred, col)),
                   ("GROUP", lambda: tlp.group_check(bent, pred, col)),
-                  ("HAVING", lambda: tlp.having_check(bent, hv, col))]
+                  ("HAVING", lambda: tlp.having_check(bent, hv, hkey,
+                                                      agg=hagg))]
         if ints:
             probes.append(("agg", lambda: tlp.agg_check(bent, pred, "SUM", ints[0])))
         for name, fn in probes:
@@ -1126,11 +1326,6 @@ expected = [
     "| `EXCEPT` | %d | | `MAX` | %d |"
     % (MEASURED["`EXCEPT`"], MEASURED["`MAX`"]),
     "| | | | `AVG` | %d |" % MEASURED["`AVG`"],
-    "| drop the `IS NULL` arm | %d |"
-    % MEASURED["dropping the IS NULL arm"],
-    "| `IS NOT TRUE` alongside an `IS NULL` arm | %d |"
-    % MEASURED["IS NOT TRUE alongside an IS NULL arm"],
-    "| a duplicated TRUE arm | %d |" % MEASURED["a duplicated TRUE arm"],
     "| `(p) OR (q)` | %d |" % MEASURED["`OR` for `AND`"],
     "| `(p)` alone, the outer filter dropped | %d |"
     % MEASURED["the outer filter dropped"],
@@ -1149,7 +1344,30 @@ expected = [
     "| every named form (`view-skew`) | %d of %d | %d |"
     % (MEASURED["against the flat query on view-skew"],
        MEASURED["flat-only cases"], MEASURED["view-vs-CTE on view-skew"]),
-]
+    "| drop the `IS NULL` arm | %d | %d |"
+    % (MEASURED["dropping the IS NULL arm"],
+       MEASURED["wide dropping the IS NULL arm"]),
+    "| `IS NOT TRUE` alongside an `IS NULL` arm | %d | %d |"
+    % (MEASURED["IS NOT TRUE alongside an IS NULL arm"],
+       MEASURED["wide IS NOT TRUE alongside an IS NULL arm"]),
+    "| a duplicated TRUE arm | %d | %d |"
+    % (MEASURED["a duplicated TRUE arm"],
+       MEASURED["wide a duplicated TRUE arm"]),
+    "| one column | %.1f | %d%% |" % (MEASURED["one grouping column"][1],
+                                      MEASURED["one grouping column"][0]),
+    "| two columns | %.1f | %d%% |" % (MEASURED["two grouping columns"][1],
+                                       MEASURED["two grouping columns"][0]),
+] + ["| `%s` | %d%% | %d%% |"
+     % (kind, MEASURED["arms %s" % kind][0], MEASURED["arms %s" % kind][1])
+     for kind in ("drop-row", "duplicate-row", "null-only", "setop-drop-row")
+     ] + ["| `%s` | %d of %d |"
+     % (agg, MEASURED["agg-skew seen by %s" % agg][0],
+        MEASURED["agg-skew seen by %s" % agg][1])
+     for agg in ("COUNT(*)", "SUM", "MIN", "MAX")
+     ] + ["| `%s` | %d / %d | %d / %d |"
+     % (agg, MEASURED["sound %s 1" % agg][0], MEASURED["sound %s 1" % agg][1],
+        MEASURED["sound %s 2" % agg][0], MEASURED["sound %s 2" % agg][1])
+     for agg in ("COUNT(*)", "SUM", "MIN", "MAX", "AVG")]
 check("every false-alarm count in README.md is the one measured here",
       [row for row in expected if row not in readme], [])
 
@@ -1485,6 +1703,7 @@ def detection_matrix(n=60, seed=0):
             col = cols[0][0]
             pred = tlp.gen_predicate(rnd, cols, 2)
             hv = tlp.gen_having(rnd, cols, 2)
+            hkey, hagg = tlp.gen_having_shape(rnd, cols)
             outer = tlp.gen_atom(rnd, cols)
             dedup = rnd.random() < 0.5
             ints = [c for c, ty in cols if ty == "INTEGER"]
@@ -1494,7 +1713,8 @@ def detection_matrix(n=60, seed=0):
                       ("NoREC", lambda: tlp.norec_check(bent, pred)),
                       ("DISTINCT", lambda: tlp.distinct_check(bent, pred, col)),
                       ("GROUP", lambda: tlp.group_check(bent, pred, col)),
-                      ("HAVING", lambda: tlp.having_check(bent, hv, col)),
+                      ("HAVING", lambda: tlp.having_check(bent, hv, hkey,
+                                                          agg=hagg)),
                       ("VIEW", lambda: tlp.view_check(bent, cols, pred, outer,
                                                       dedup))]
             if ints:

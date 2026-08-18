@@ -518,12 +518,51 @@ Not over a join, not over an aggregate, not over another view.
            the inner query. And NOT MATERIALIZED on the plain CTE is an
            equivalent rewrite, since SQLite's plan for a CTE referenced
            once is already the flattened one.
-- [ ] 14 HAVING over SUM, MIN and MAX, and a second grouping column
+- [x] 14 HAVING over SUM, MIN and MAX, and a second grouping column
       why: item 10 partitions HAVING only for COUNT(*) on one grouping
            column, the easiest case: COUNT(*) is never NULL and
            one column groups NULLs into exactly one group. Two columns
            make the grouping key a tuple with its own NULL rule, and the
            other aggregates reach the composition table again.
+      done: the grouping key is one column or two and the select list
+           carries COUNT(*), SUM, MIN or MAX, both drawn per case, so what
+           the selftest and the suite point at is what ships.
+      proves: sound in all ten combinations, 0 false alarms each, AVG
+           included. 0 disagreements over 400 queries, 216 of them on a
+           two-column key.
+           The arms are still load-bearing in the widened shape: on two
+           columns carrying a SUM, dropping the IS NULL arm raises 104
+           false alarms in 173, IS NOT TRUE beside an IS NULL arm 104, and
+           a duplicated TRUE arm 132.
+           having-agg-skew is the defect the widening bought: one group's
+           SUM, MIN or MAX one too high out of a filtered query, caught
+           107 times in 173 with an aggregate in the select list and 0
+           times with COUNT(*). Nothing else here writes a HAVING clause,
+           so nothing else sees it at all.
+      found: the premise of this item was wrong, and that is the finding.
+           The other aggregates do NOT reach the composition table.
+           HAVING splits groups and never cuts one, so each group arrives
+           whole in a single arm with its aggregate already computed and
+           nothing is recombined for a rule to be wrong about. AVG is the
+           proof: aggregate TLP has no rule for it and cannot carry it,
+           and here it needs no more care than COUNT(*).
+           The second grouping column moved a number the other way from
+           my guess. More groups is an easier split, not a harder one:
+           3.9 groups and 17% three-valued on one column against 6.5 and
+           27% on two, so the wider key is the better generator.
+           And it found a defect in a planted bug. group-skew added 1 to
+           column 1 of a grouped result, which was the count only while
+           every grouped query here was (key, COUNT(*)) on one column. A
+           two-column key makes column 1 part of the KEY, so it
+           incremented a grouping value, and against a TEXT one it raised
+           a TypeError out of the middle of a selftest run rather than
+           reporting anything. It corrupts the last column now.
+      note: the two-arm against three-arm detection table in the README
+           was measured by hand and nothing reproduced it. It is in the
+           suite now, which moved null-only from 21% to the 20% this
+           machine measures, and the finding it carries is unchanged:
+           identical detection, because these wrappers corrupt result
+           sets and not plans.
 - [ ] 15 LIKE with ESCAPE, and GLOB character classes
       why: item 12 bought LIKE at the price of a five-character pattern
            alphabet, because the LIKE-to-GLOB rewrite breaks on any GLOB
