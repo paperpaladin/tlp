@@ -9,20 +9,21 @@ $ python3 tlp.py tlp --n 500
 TLP: 500 queries, 0 disagreements, 0 skipped, 150 genuinely three-valued (30%)
 
 $ python3 tlp.py selftest
-planted bug           TLP  NoREC   agg  DISTINCT  GROUP  HAVING   LIKE   VIEW
-drop-row             100%     0%    0%        0%    73%     90%     0%     0%
-duplicate-row        100%     0%    0%        0%   100%    100%     0%     0%
-null-only             23%     0%    0%        0%    22%     29%     0%     0%
-count-off-by-one       0%   100%    0%        0%     0%      0%     0%     0%
-aggregate-skew         0%     0%   88%        0%     0%      0%     0%     0%
-distinct-dup           0%     0%    0%      100%     0%      0%     0%    21%
-group-skew             0%     0%    0%        0%   100%     81%     0%     0%
-setop-drop-row       100%     0%    0%       73%    73%     90%     0%     0%
-having-drop-group      0%     0%    0%        0%     0%     99%     0%     0%
-glob-skew              0%     0%    0%        0%     0%      0%    25%     0%
-groupfilter-skew       0%     0%    0%        0%   100%      0%     0%     0%
-view-skew              0%     0%    0%        0%     0%      0%     0%    38%
-having-agg-skew        0%     0%    0%        0%     0%     29%     0%     0%
+planted bug           TLP  NoREC   agg  DISTINCT  GROUP  HAVING   LIKE   VIEW  FNMATCH
+drop-row             100%     0%    0%        0%    79%     87%     0%     0%       0%
+duplicate-row        100%     0%    0%        0%   100%    100%     0%     0%       0%
+null-only             23%     0%    0%        0%    23%     26%     0%     0%       0%
+count-off-by-one       0%   100%    0%        0%     0%      0%     0%     0%       0%
+aggregate-skew         0%     0%   83%        0%     0%      0%     0%     0%       0%
+distinct-dup           0%     0%    0%      100%     0%      0%     0%    24%       0%
+group-skew             0%     0%    0%        0%   100%     76%     0%     0%       0%
+setop-drop-row       100%     0%    0%       79%    79%     87%     0%     0%       0%
+having-drop-group      0%     0%    0%        0%     0%     99%     0%     0%       0%
+glob-skew              0%     0%    0%        0%     0%      0%    22%     0%       0%
+groupfilter-skew       0%     0%    0%        0%   100%      0%     0%     0%       0%
+view-skew              0%     0%    0%        0%     0%      0%     0%    41%       0%
+having-agg-skew        0%     0%    0%        0%     0%     29%     0%     0%       0%
+globclass-skew         0%     0%    0%        0%     0%      0%     0%     0%      23%
 
 every planted bug is caught by at least one oracle
 ```
@@ -104,10 +105,14 @@ was built for and **nothing else**:
   out by one is invisible to all of them.
 - None of the six reads a view or a CTE, so a query that answers one way
   flat and another way through a name is invisible to all of them.
+- None of the seven can write a negated character class, because `LIKE` has
+  none and a translation cannot invent one, so a class matcher that is
+  wrong only when the class is negated is invisible to all of them. That
+  one is answered by Python's `fnmatch` rather than by SQLite.
 
 ### And the matrix itself was missing four relations
 
-The check above covers the single-table relations, eight of them now. It
+The check above covers the single-table relations, nine of them now. It
 did not cover the four join relations, while the module docstring claimed
 *"eleven relations, and none of them is redundant: for every pair there is
 a planted bug one catches and the other does not"*.
@@ -165,7 +170,7 @@ planted bug's trigger, not of the relation.
 
 Separating the two explanations costs one more planted bug. `setop-drop-row`
 is the same lost row fired on any set operation, and the `DISTINCT` column
-moves to 73%, so the relation sees lost rows fine, and it was the bug
+moves to 79%, so the relation sees lost rows fine, and it was the bug
 that could not see the relation. That row of the table exists only to
 answer that question, and without it the table would be quietly overclaiming.
 
@@ -581,11 +586,12 @@ rates are printed without an assertion the sample size cannot support.
 
 ## Two pattern matchers, pointed at each other
 
-This is the one differential oracle here, not a metamorphic one,
-and it still needs no second database. **SQLite ships two independent
-pattern matchers.** `LIKE` and `GLOB` are separate implementations with
-separate wildcard syntax, and over a restricted alphabet the two languages
-say the same thing under `%` -> `*` and `_` -> `?`:
+The differential oracles here, where everything above is metamorphic.
+**SQLite ships two independent pattern matchers**, and they can be pointed
+at each other with no second database: `LIKE` and `GLOB` are separate
+implementations with separate wildcard syntax, and the two languages say
+the same thing under a translation that knows which characters are
+literal.
 
 ```sql
     SELECT * FROM t WHERE c LIKE 'a%b'
@@ -594,8 +600,9 @@ say the same thing under `%` -> `*` and `_` -> `?`:
 
 ```
 $ python3 tlp.py like --n 400
-LIKE vs GLOB: 339 queries, 0 disagreements, 61 skipped,
-              112 where the pattern split the table (33%)
+LIKE vs GLOB: 344 queries, 0 disagreements, 56 skipped,
+              122 where the pattern split the table (35%),
+              6171 values classified against fnmatch
 ```
 
 Row for row, `NULL` included, where both must yield NULL,
@@ -603,7 +610,7 @@ not FALSE. The vacuity question is different again here. A pattern matching no
 row, or every row, makes the two matchers agree trivially, so what is
 reported is how often the pattern actually split the table.
 
-### Two preconditions, both enforced
+### Two preconditions, one enforced and one translated away
 
 `LIKE` folds ASCII case and `GLOB` never does. Left alone, the two
 disagree on the first capital letter. So `case_sensitive_like=ON` is pinned
@@ -613,8 +620,9 @@ loudly, it would quietly measure something else. The suite checks that a
 connection *without* the pragma answers differently. Nothing else
 establishes that the pinning does anything.
 
-**The rewrite is only valid over an alphabet with no `GLOB`
-metacharacters.** This is the part that would hold quietly and then not:
+The second precondition used to be a restriction and is now a translation.
+A pair of string replacements cannot rewrite a pattern that already
+contains something `GLOB` reads as syntax:
 
 ```
 'axb' LIKE 'a*b'   is FALSE   -- * is a literal to LIKE
@@ -622,13 +630,104 @@ metacharacters.** This is the part that would hold quietly and then not:
 ```
 
 and the same for `?`, and for `[`, which opens a character class in `GLOB`
-and is a literal in `LIKE`. Backslash is out too, because `LIKE` takes an
-`ESCAPE` clause and `GLOB` has none. So generated patterns are built only
-from `a`, `b`, `c`, `%` and `_`, `like_to_glob` *asserts* that,
-not trusting it, and the suite checks both that the assertion fires and that
-translating such a pattern anyway really would change what is matched.
+and is a literal in `LIKE`. Item 12 refused those patterns. Item 15
+translates them, because a character class containing one member is how
+glob syntax spells a literal and it is the only way to spell one when the
+language has no escape character at all:
+
+```
+    'a*b' LIKE    ->  'a[*]b' GLOB
+    'a[b' LIKE    ->  'a[[]b' GLOB
+    'a]b' LIKE    ->  'a[]]b' GLOB
+```
+
+`like_to_glob` is a walker rather than two replacements now, and every
+character it can be handed is checked in both implementations: a literal
+spelled that way matches itself in SQLite and in Python's `fnmatch`.
+
+### LIKE's ESCAPE clause, which GLOB has no answer to
+
+`c LIKE 'a\%b' ESCAPE '\'` matches the three characters `a%b` and nothing
+else. `GLOB` has no escape character and needs none, because an escaped
+character is just a literal: the escape disappears and the character is
+spelled out by the same walker. SQLite drops an escape in front of an
+ordinary character and takes the character literally with no error, which
+is one fewer special case than the standard suggests.
+
+One pattern is still refused rather than translated. A trailing escape
+matches nothing at all in SQLite, and no `GLOB` pattern matches nothing,
+so there is nothing honest to translate it to. The suite checks the
+refusal and checks SQLite really does match nothing.
+
+The generated patterns agree with SQLite over 6900 value/pattern pairs,
+and three shapes are counted in what the generator emitted rather than
+assumed: an escape at all, an escaped wildcard, and a literal `GLOB`
+metacharacter. A sweep over patterns carrying no escape would agree
+perfectly and prove nothing.
+
+That sweep is run over a fixture rather than over generated tables, and
+the reason is worth stating because it caught a hole. Generated `TEXT`
+columns hold `a`, `bb` and `c`, so a pattern looking for a literal `%` or
+a backslash matches nothing on either side and the two agree about the
+empty set. Dropping the `ESCAPE` clause from the relation altogether
+raises no false alarm over generated tables for exactly that reason, and
+it survived the suite until the fixture was added. The fixture holds the
+characters the escape machinery is about.
+
+### An oracle that is not SQLite
+
+`GLOB` has character classes and `LIKE` has nothing resembling them, so
+the two-matcher oracle cannot reach them however the pattern is
+translated. Python's `fnmatch` is the same glob language, and it is the
+only comparison in this project against an implementation that is not
+SQLite:
+
+```sql
+    SELECT c FROM t WHERE c GLOB 'a[^bc]*'
+==  [v for v in c if fnmatch.fnmatchcase(v, 'a[!bc]*')]
+```
+
+The one difference between the two languages is how a class is negated:
+SQLite writes `[^abc]` and `fnmatch` writes `[!abc]`, and each reads the
+other's character as an ordinary member. Mapping between them is
+load-bearing rather than cosmetic: left alone, two of three probe cases
+disagree.
+
+The sub-language the comparison stays inside is narrower than either
+implementation, and the three forms left out are left out because the two
+really do disagree there:
+
+| form | SQLite | fnmatch |
+|---|---|---|
+| `'a[' GLOB 'a['` | 0, an unterminated class matches nothing | 1, a literal `[` |
+| `'ab' GLOB 'a[!b]'` | 1, a class of `!` and `b` | 0, a negation |
+| `'a^b' GLOB 'a[^]b'` | 0 | 1 |
+
+`glob_to_fnmatch` asserts the restriction instead of trusting it, the same
+way the pattern alphabet was asserted in item 12, and the suite checks
+both that the assertion fires and that each excluded form really does
+disagree.
+
+Three patterns are put to every table rather than one. An oracle that asks
+a single question about a table is weaker than one asking several, and the
+question is cheap here: a pattern matching none of the eight rows agrees
+with Python trivially. 6,600 scalar pairs agree, and over generated tables
+3,792 values are classified by both sides with 243 of 633 patterns
+splitting the column.
+
+A negated class is also the one thing in the pattern language that `LIKE`
+cannot express at all, which is what keeps this comparison out of the
+dominated list in the matrix. `globclass-skew` is a class matcher wrong
+only when the class is negated: caught 23% of the time by the `fnmatch`
+comparison and 0% by all eight other relations.
+
+What the comparison does not cover: the translations `like_to_glob`
+emits. Those can contain `[[]` and `[]]`, which are outside
+`glob_to_fnmatch`'s agreed alphabet, and the authority for what a `LIKE`
+pattern means is SQLite's own `LIKE` rather than Python.
 
 ### It reaches the other oracles too
+
 
 Pattern matching was added to the shared atom generator instead of bolted
 on as a tenth relation, so `LIKE` and `GLOB` now appear inside the
@@ -868,10 +967,16 @@ No floating point, no collation-dependent operators, no triggers,
 foreign keys, virtual tables or window functions. A view is in, but only
 the one shape the view relation builds: one filter inside it, one atom
 outside it, and an optional `DISTINCT`. No view over a join, no view over
-an aggregate, no view selecting from another view. `LIKE` is in, but only
-with its case folding pinned off and only over a five-character pattern
-alphabet; `ESCAPE` clauses, character classes and `LIKE` on non-text
-columns are all absent. Row
+an aggregate, no view selecting from another view. `LIKE` is in, with its case
+folding pinned off, and so are its `ESCAPE` clause and `GLOB`'s character
+classes. What is still absent: the shared predicate generator stays on the
+five-character alphabet, so a partitioned predicate never carries an
+`ESCAPE` clause and only the `like` relation does; `LIKE` on a non-text
+column is never generated; generated `TEXT` values are `a`, `bb` and `c`,
+so the escape machinery is exercised against a fixture of hostile values
+rather than against generated tables; and three `GLOB` class forms are out
+of the `fnmatch` comparison because the two implementations disagree on
+them, listed above with what each one answers. Row
 order is never compared, only sorted multisets, because SQL does not
 promise an order without `ORDER BY` and comparing sequences would report a
 bug every time the planner legitimately changed its mind.
@@ -929,7 +1034,7 @@ equivalent mutant, not a hole.
 
 ```
 $ make test
-173 passed, 0 failed
+193 passed, 0 failed
 ```
 
 No pytest, no network, no dependencies. `sqlite3` is in the standard

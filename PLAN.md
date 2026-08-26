@@ -17,7 +17,7 @@ tlp.py join3   [--n N] [--seed S]    three tables, and join reordering
 tlp.py distinct [--n N] [--seed S]   partition a DISTINCT
 tlp.py group   [--n N] [--seed S]    partition a GROUP BY
 tlp.py having  [--n N] [--seed S]    partition a HAVING clause
-tlp.py like    [--n N] [--seed S]    LIKE against GLOB
+tlp.py like    [--n N] [--seed S]    LIKE against GLOB, GLOB against fnmatch
 tlp.py view    [--n N] [--seed S]    a view and a CTE against the flat query
 tlp.py selftest                      plant bugs, check the oracles notice
 tlp.py joinselftest                  the same, for the join relations
@@ -563,13 +563,69 @@ Not over a join, not over an aggregate, not over another view.
            machine measures, and the finding it carries is unchanged:
            identical detection, because these wrappers corrupt result
            sets and not plans.
-- [ ] 15 LIKE with ESCAPE, and GLOB character classes
+- [x] 15 LIKE with ESCAPE, and GLOB character classes
       why: item 12 bought LIKE at the price of a five-character pattern
            alphabet, because the LIKE-to-GLOB rewrite breaks on any GLOB
            metacharacter. ESCAPE and [...] are exactly the parts that were
            excluded, and they need an oracle that is not the other matcher,
            most likely Python's fnmatch and a hand-written escape
            walker, a different kind of oracle from anything here.
+      done: both, and the escape walker turned out to keep the two-matcher
+           oracle rather than needing a new one. like_to_glob is a walker
+           now instead of two string replacements: % and _ become * and ?,
+           an escaped character becomes a literal and the escape
+           disappears, and a literal that GLOB reads as syntax is spelled
+           as a character class containing it, which is the only way to
+           spell a literal in a language with no escape character:
+               'a*b' LIKE  ->  'a[*]b' GLOB
+               'a[b' LIKE  ->  'a[[]b' GLOB
+           Python's fnmatch is the second oracle and the only
+           implementation this project compares against that is not
+           SQLite. It is there for the character classes, which LIKE
+           cannot express at all.
+      proves: the walker agrees with SQLite over 6900 value/pattern pairs,
+           and the four patterns item 12 refused now translate and agree.
+           SQLite GLOB and fnmatch agree over 6600 scalar pairs and over
+           3792 values classified across generated tables, with 243 of 633
+           patterns splitting the column.
+           globclass-skew is the defect fnmatch buys: a class matcher
+           wrong only when the class is NEGATED, caught 23% by the
+           comparison and 0% by the eight other relations, because a
+           negated class is the one thing in the pattern language LIKE has
+           no counterpart for.
+           The negation mapping is load-bearing: [^abc] is SQLite's
+           negation and a class of literals to fnmatch, and 2 of 3 probe
+           cases disagree without the mapping.
+      found: the ESCAPE comparison was passing over generated tables while
+           being completely unwired, and the value domain is why. TEXT
+           columns hold a, bb and c, so a pattern looking for a literal %
+           or backslash matches nothing on either side and the two agree
+           about the empty set. Dropping the ESCAPE clause from
+           like_glob_check raises 0 false alarms over generated tables,
+           which is the mutant that survived until the relation was also
+           run over a fixture holding the characters the escape machinery
+           is about. An oracle whose data cannot contain the thing it
+           tests is not testing it.
+           SQLite also drops an escape in front of an ordinary character
+           and takes that character literally, with no error, which is one
+           fewer special case than the standard suggests. A trailing
+           escape matches nothing at all, and that is the one pattern the
+           walker refuses, because no GLOB pattern matches nothing.
+      note: the sub-language the fnmatch comparison stays inside is
+           narrower than either implementation, and glob_to_fnmatch
+           asserts it. Three forms are excluded because the two really
+           disagree, measured: an unterminated class, which SQLite never
+           matches and fnmatch reads as a literal [; a class whose first
+           member is !, which fnmatch reads as a negation; and an empty
+           class.
+           Three patterns are put to each table rather than one, because
+           an oracle asking a single question about a table is weaker than
+           one asking several and a pattern matching no row agrees with
+           Python trivially.
+           One mutant survives: filtering the Python side on `v is not
+           None` instead of on isinstance(v, str) changes nothing, because
+           every caller passes a TEXT column and those hold only strings
+           and NULL. An equivalent mutant, not a hole.
 - [ ] 16 the reducer shrinks the schema too
       why: an unused column survives into the reduced CREATE TABLE even
            when nothing in the surviving predicate mentions it, which the

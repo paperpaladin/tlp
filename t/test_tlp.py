@@ -1585,15 +1585,34 @@ check("GLOB was always case-sensitive",
 # Two: the rewrite % -> * and _ -> ? is sound only over PAT_CHARS. A
 # pattern already carrying a GLOB metacharacter means one side reads it as
 # a wildcard and the other as a literal.
-check("the pattern alphabet contains no GLOB metacharacter",
+check("the shared pattern alphabet contains no GLOB metacharacter",
       [c for c in tlp.PAT_CHARS if c in "*?[]\\"], [])
+
+# Item 12 REFUSED the four patterns below, because a two-character
+# replacement cannot translate them. Item 15 translates them instead, by
+# spelling a literal as a GLOB character class containing it, and the
+# translation is checked against SQLite rather than reasoned about.
+wrong = []
+for pat in ("a*b", "a?b", "a[b]c", "a\\_b", "a]b", "[a]"):
+    g = tlp.like_to_glob(pat)
+    for v in ("axb", "a*b", "a?b", "a[b]c", "abc", "a]b", "[a]", "a\\xb", ""):
+        a, b = pinned.execute("SELECT ? LIKE ?, ? GLOB ?",
+                              (v, pat, v, g)).fetchone()
+        if a != b:
+            wrong.append((v, pat, g, a, b))
+check("a literal metacharacter is translated, not refused", wrong, [])
+
+# The one pattern the walker still refuses. SQLite matches nothing at all
+# for a trailing escape, and no GLOB pattern matches nothing, so there is
+# nothing to translate it to.
+check("'ab\\' ESCAPE '\\' matches nothing in SQLite",
+      pinned.execute("SELECT 'ab' LIKE 'ab\\' ESCAPE '\\'").fetchone()[0], 0)
 refused = 0
-for pat in ("a*b", "a?b", "a[b]c", "a\\_b"):
-    try:
-        tlp.like_to_glob(pat)
-    except AssertionError:
-        refused += 1
-check("like_to_glob refuses an untranslatable pattern", refused, 4)
+try:
+    tlp.like_to_glob("ab\\", "\\")
+except AssertionError:
+    refused = 1
+check("...and like_to_glob refuses it rather than inventing one", refused, 1)
 
 # And the restriction is load-bearing: translated naively, those same
 # patterns really do make the two matchers disagree.
@@ -1624,10 +1643,141 @@ for v in vals:
 check("LIKE and GLOB agree over %d value/pattern pairs, NULL included"
       % (len(vals) * len(pats)), mismatch, [])
 
-# Over generated tables, against a correct engine.
+# The ESCAPE clause, which is the half of item 15 that stays inside the
+# two-matcher oracle. GLOB has no escape character, and needs none: an
+# escaped character is a literal, so the escape disappears and the literal
+# is spelled out. Every generated pattern is put to both matchers against
+# values that include the escape characters themselves.
+EVALS = [None, "", "a", "b", "ab", "abc", "a%b", "a_b", "a*b", "a?b", "a[b",
+         "a]b", "a\\b", "a@b", "aa", "A", "%", "_", "*", "?", "[", "]", "c"]
+rnd = random.Random(0)
+esc_pairs = esc_bad = 0
+for _ in range(300):
+    pat, esc = tlp.gen_escaped_pattern(rnd)
+    try:
+        g = tlp.like_to_glob(pat, esc)
+    except AssertionError:
+        continue
+    for v in EVALS:
+        a, b = pinned.execute("SELECT ? LIKE ? ESCAPE ?, ? GLOB ?",
+                              (v, pat, esc, v, g)).fetchone()
+        esc_pairs += 1
+        esc_bad += (a != b)
+check("the escape walker agrees with SQLite over %d pairs" % esc_pairs,
+      esc_bad, 0)
+ok("...and that is %d pairs, not none" % esc_pairs) if esc_pairs > 3000 else \
+    no("the escape sweep compared almost nothing", str(esc_pairs))
+
+# A sweep over patterns that carry no escape would agree with SQLite
+# perfectly and prove nothing about the walker, so what the generator
+# emitted is counted rather than assumed. Three shapes have to appear: an
+# escape at all, an escaped wildcard, which is the whole point of the
+# clause, and a literal GLOB metacharacter, which is what item 12's
+# five-character alphabet could not carry.
+rnd = random.Random(0)
+shapes = {"an escape": 0, "an escaped wildcard": 0, "a GLOB metacharacter": 0}
+for _ in range(300):
+    pat, esc = tlp.gen_escaped_pattern(rnd)
+    shapes["an escape"] += esc in pat
+    shapes["an escaped wildcard"] += (esc + "%" in pat or esc + "_" in pat)
+    shapes["a GLOB metacharacter"] += any(c in pat for c in "*?[]")
+for label, n in sorted(shapes.items()):
+    if n > 30:
+        ok("the escaped-pattern generator emits %s (%d of 300)" % (label, n))
+    else:
+        no("the escaped-pattern generator never emits %s" % label, str(n))
+
+# The same for the GLOB side: a negated class is the form LIKE cannot
+# express at all, so a generator that stopped emitting them would leave
+# the fnmatch comparison measuring what the two-matcher relation already
+# covers.
+rnd = random.Random(0)
+neg = ranges = 0
+for _ in range(300):
+    pat = tlp.gen_glob_pattern(rnd)
+    neg += "[^" in pat
+    ranges += "-" in pat
+ok("the GLOB generator emits negated classes (%d of 300) and ranges (%d)"
+   % (neg, ranges)) if neg > 30 and ranges > 30 else \
+    no("the GLOB generator does not reach both class forms",
+       "%d negated, %d ranges" % (neg, ranges))
+
+# The class form glob_literal uses is the one place where the two
+# implementations have to agree about syntax rather than about a match, so
+# every character it can be handed is put to both. No dialect mapping in
+# between: that form carries no negation, which is the only syntax the two
+# languages spell differently.
+import fnmatch as _fn
+lit_bad = []
+for c in tlp.PAT_LITERALS + ["%", "_", "@", "\\", "^", "!", "-"]:
+    g = tlp.glob_literal(c)
+    sq = pinned.execute("SELECT ? GLOB ?", (c, g)).fetchone()[0]
+    py = int(_fn.fnmatchcase(c, g))
+    if not (sq == 1 and py == 1):
+        lit_bad.append((c, g, sq, py))
+check("a literal spelled as a class matches itself in SQLite and fnmatch",
+      lit_bad, [])
+
+# fnmatch is the one oracle in this project that is not SQLite, and the
+# reason it is here is that GLOB's character classes have no counterpart
+# in LIKE at all. Scalar first, over every pattern the generator emits.
+rnd = random.Random(1)
+fn_pairs = fn_bad = 0
+for _ in range(300):
+    pat = tlp.gen_glob_pattern(rnd)
+    f = tlp.glob_to_fnmatch(pat)
+    for v in EVALS:
+        if v is None:
+            continue
+        sq = pinned.execute("SELECT ? GLOB ?", (v, pat)).fetchone()[0]
+        fn_pairs += 1
+        fn_bad += (sq != int(_fn.fnmatchcase(v, f)))
+check("SQLite GLOB and fnmatch agree over %d value/pattern pairs" % fn_pairs,
+      fn_bad, 0)
+
+# The sub-language is narrower than either implementation, and the three
+# forms left out of it are left out because the two really do disagree
+# there. Measured, so the restriction is known to be load-bearing rather
+# than inherited from a reading of the documentation.
+divergent = []
+for v, pat in (("a[", "a["),          # unterminated: SQLite never matches
+               ("ab", "a[!b]"),       # ! first: fnmatch reads a negation
+               ("a^b", "a[^]b")):     # empty class
+    sq = pinned.execute("SELECT ? GLOB ?", (v, pat)).fetchone()[0]
+    if sq != int(_fn.fnmatchcase(v, pat)):
+        divergent.append((v, pat))
+check("the three excluded class forms really do disagree", len(divergent), 3)
+refused = 0
+for pat in ("a[", "a[]b", "a[^]b"):
+    try:
+        tlp.glob_to_fnmatch(pat)
+    except AssertionError:
+        refused += 1
+check("...and glob_to_fnmatch refuses them rather than translating",
+      refused, 3)
+# A class starting with ! is a legal SQLite class of literals, and the
+# generator never emits one. Nothing in the sub-language depends on that
+# being untranslatable, so it is recorded as excluded, not as impossible.
+check("a ! is not a generated class member", "!" in tlp.CLASS_CHARS, False)
+
+# And the negation mapping is load-bearing: left alone, [^ab] is a class
+# of literals to fnmatch and a negation to SQLite, which is the one
+# syntactic difference between the two languages.
+naive = 0
+for v, pat in (("ab", "a[^b]"), ("a^b", "a[^b]"), ("ac", "a[^b]")):
+    sq = pinned.execute("SELECT ? GLOB ?", (v, pat)).fetchone()[0]
+    naive += (sq != int(_fn.fnmatchcase(v, pat)))
+ok("mapping [^ ] to [! ] is load-bearing: %d of 3 disagree without it"
+   % naive) if naive >= 2 else \
+    no("the negation mapping changes nothing", "%d of 3" % naive)
+
+# Over generated tables, against a correct engine. All three comparisons
+# the relation ships with: the plain pattern, the escaped pattern, and the
+# GLOB patterns against fnmatch.
 rnd = random.Random(1)
 db = tlp.connect()
 alarms = tested = split = 0
+esc_alarms = fn_alarms = fn_classified = fn_split = 0
 for _ in range(250):
     _, cols, rows = tlp.build(db, rnd, 8, 0.25)
     text = [c for c, t in cols if t == "TEXT"]
@@ -1635,16 +1785,71 @@ for _ in range(250):
         continue
     col = rnd.choice(text)
     pat = tlp.gen_pattern(rnd)
+    epat, esc = tlp.gen_escaped_pattern(rnd)
+    gpats = tlp.gen_glob_patterns(rnd)
     try:
         bad = tlp.like_glob_check(db, col, pat)
+        ebad = tlp.like_glob_check(db, col, epat, esc)
+        fbad = tlp.glob_fnmatch_check(db, col, gpats)
         hit = db.execute("SELECT COUNT(*) FROM t WHERE %s LIKE '%s'"
                          % (col, pat)).fetchone()[0]
+        vals = [v for (v,) in tlp.rows_of(db, "SELECT %s FROM t" % col)
+                if isinstance(v, str)]
+        ghits = [db.execute("SELECT COUNT(*) FROM t WHERE %s GLOB '%s'"
+                            % (col, g)).fetchone()[0] for g in gpats]
     except sqlite3.Error:
         continue
     tested += 1
     alarms += bool(bad)
+    esc_alarms += bool(ebad)
+    fn_alarms += bool(fbad)
+    fn_classified += len(vals) * tlp.GLOB_PROBES
+    fn_split += sum(0 < h < len(vals) for h in ghits)
     split += (0 < hit < len(rows))
 check("the LIKE/GLOB relation raises no false alarm", alarms, 0)
+check("...and nor does it with an ESCAPE clause", esc_alarms, 0)
+
+# That last line is worth very little on generated tables and the reason
+# is the value domain: TEXT columns hold "a", "bb" and "c", so a pattern
+# with a literal % or backslash in it matches nothing on either side and
+# the two agree about the empty set. Dropping the ESCAPE clause from the
+# relation entirely survives the check above for exactly that reason.
+#
+# So the relation is also run over a fixture of the characters the escape
+# machinery is about. Same function, hostile values.
+fixture = tlp.connect()
+fixture.execute("CREATE TABLE t (c0 TEXT)")
+fixture.executemany("INSERT INTO t VALUES (?)",
+                    [(v,) for v in EVALS if v is None or isinstance(v, str)])
+rnd = random.Random(2)
+fx_alarms = fx_tested = fx_split = 0
+nrows = fixture.execute("SELECT COUNT(*) FROM t").fetchone()[0]
+for _ in range(300):
+    pat, esc = tlp.gen_escaped_pattern(rnd)
+    try:
+        bad = tlp.like_glob_check(fixture, "c0", pat, esc)
+        hit = fixture.execute("SELECT COUNT(*) FROM t WHERE c0 LIKE ? ESCAPE ?",
+                              (pat, esc)).fetchone()[0]
+    except (sqlite3.Error, AssertionError):
+        continue
+    fx_tested += 1
+    fx_alarms += bool(bad)
+    fx_split += (0 < hit < nrows)
+check("the ESCAPE form raises no false alarm over values that contain "
+      "the characters it is about", fx_alarms, 0)
+ok("...over %d patterns against %d rows, %d of them matching some but not "
+   "all" % (fx_tested, nrows, fx_split)) if fx_split > 30 else \
+    no("the escape fixture patterns match nothing",
+       "%d splits in %d" % (fx_split, fx_tested))
+check("the GLOB/fnmatch comparison raises no false alarm", fn_alarms, 0)
+# Two numbers that keep the line above from meaning nothing. A column of
+# NULLs is classified by neither side, and a pattern matching no row or
+# every row agrees with Python trivially.
+ok("...over %d values classified, %d of the %d patterns splitting the "
+   "column" % (fn_classified, fn_split, tested * tlp.GLOB_PROBES)) \
+    if fn_classified > 1000 and fn_split > tested // 2 else \
+    no("the fnmatch comparison classified almost nothing",
+       "%d values, %d splits" % (fn_classified, fn_split))
 pct = split * 100 // tested
 # A pattern matching no row, or every row, makes both matchers agree
 # trivially. That is this relation's vacuity question -- not
@@ -1692,7 +1897,7 @@ ok("pattern matching reaches the shared predicate generator (%d of 400)"
 def detection_matrix(n=60, seed=0):
     """rows = planted bug, columns = relation, values = hit count."""
     names = ("TLP", "NoREC", "agg", "DISTINCT", "GROUP", "HAVING", "LIKE",
-             "VIEW")
+             "VIEW", "FNMATCH")
     matrix = {}
     for kind in tlp.BUG_KINDS:
         rnd = random.Random(seed)
@@ -1724,6 +1929,10 @@ def detection_matrix(n=60, seed=0):
                 probes.append(("LIKE",
                                lambda: tlp.like_glob_check(
                                    bent, rnd.choice(text), tlp.gen_pattern(rnd))))
+                probes.append(("FNMATCH",
+                               lambda: tlp.glob_fnmatch_check(
+                                   bent, rnd.choice(text),
+                                   tlp.gen_glob_patterns(rnd))))
             for name, fn in probes:
                 try:
                     hits[name] += bool(fn())
@@ -1754,6 +1963,12 @@ check("every relation catches at least one planted bug", useless, [])
 # something mysterious. Nothing else here reads a view or a CTE.
 check("view-skew is caught by the view relation and by nothing else",
       [a for a in names if matrix["view-skew"][a]], ["VIEW"])
+
+# The same for the comparison against fnmatch. A negated character class
+# is the one thing here LIKE cannot express at all, so it is the one thing
+# the two-matcher relation cannot reach however the pattern is translated.
+check("globclass-skew is caught by the fnmatch comparison and nothing else",
+      [a for a in names if matrix["globclass-skew"][a]], ["FNMATCH"])
 
 # And every planted bug must be caught, which is the property `selftest`
 # exits non-zero on.

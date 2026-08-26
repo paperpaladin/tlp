@@ -25,7 +25,7 @@ it looks: a predicate that is never NULL leaves the third arm empty, and the
 test degenerates into "the engine agrees with itself about TRUE and FALSE",
 which it will. Measuring that is what `tlp vacuity` is for.
 
-Twelve relations, and none of them is redundant: for every pair there is a
+Thirteen relations, and none of them is redundant: for every pair there is a
 planted bug one catches and the other does not. That is measured rather
 than asserted -- `selftest` and `joinselftest` plant the bugs and print
 which relations noticed -- and the measurement has earned its keep twice,
@@ -43,7 +43,7 @@ check covered seven.
     tlp.py having          partitioning a HAVING, which partitions GROUPS
     tlp.py join            partitioning a join's ON clause
     tlp.py join3           three tables, and the planner's join order
-    tlp.py like            LIKE against GLOB, SQLite's other pattern matcher
+    tlp.py like            LIKE against GLOB, and GLOB against fnmatch
     tlp.py view            a view and a CTE against the query they name
     tlp.py agg             SUM, COUNT, MIN and MAX over the three partitions
     tlp.py selftest        plant bugs, check which relations notice
@@ -53,6 +53,7 @@ check covered seven.
 Exit status: 0 nothing found, 1 a disagreement was found, 2 usage error.
 """
 import argparse
+import fnmatch
 import itertools
 import sqlite3
 import sys
@@ -242,19 +243,33 @@ def connect():
     return db
 
 
-# A LIKE pattern is built only from these, and the restriction is
-# load-bearing rather than tidiness. The relation below rewrites a LIKE
-# pattern into a GLOB one by % -> * and _ -> ?, which is wrong the moment
-# the pattern already contains a GLOB metacharacter:
+# The alphabet the SHARED generator builds a pattern from. % and _ are
+# LIKE's two wildcards and the rest are letters, and the five characters
+# are all item 12 allowed itself, because the naive rewrite % -> * and
+# _ -> ? is wrong the moment the pattern already contains something GLOB
+# reads as syntax:
 #
 #   'axb' LIKE 'a*b'   is FALSE   -- * is a literal to LIKE
 #   'axb' GLOB 'a*b'   is TRUE    -- * is a wildcard to GLOB
 #
-# and the same for ?, and for [ which opens a character class in GLOB and
-# is a literal in LIKE. So *, ?, [ and ] never appear in a generated
-# pattern, and neither does the backslash, because LIKE takes an ESCAPE
-# clause and GLOB has none.
+# The `like` relation is no longer restricted to this: item 15 made
+# like_to_glob a walker that spells a literal *, ? or [ as a GLOB
+# character class containing it, and that handles LIKE's ESCAPE clause,
+# which GLOB has no equivalent of. The shared generator stays on the five
+# characters deliberately. An ESCAPE clause in a partitioned predicate
+# tests the escape machinery, which the `like` relation already tests
+# directly, and it would move every measured number in this file for no
+# new coverage of the partitioning the predicate is there for.
 PAT_CHARS = ["a", "b", "c", "%", "_"]
+
+# What the `like` relation adds. The three characters GLOB reads as syntax
+# appear as LIKE literals, and % and _ appear escaped, meaning themselves.
+PAT_LITERALS = ["a", "b", "c", "*", "?", "[", "]"]
+ESCAPE_CHARS = ["\\", "@"]
+
+# Members a generated GLOB character class is built from, and the reason
+# the list excludes three characters is in gen_glob_pattern.
+CLASS_CHARS = ["a", "b", "c", "*", "?", "%", "_"]
 
 
 def gen_atom(rnd, cols):
@@ -290,20 +305,153 @@ def gen_atom(rnd, cols):
 
 
 def gen_pattern(rnd, op="LIKE"):
-    """A pattern from the restricted alphabet, in the right dialect."""
+    """A pattern from the shared alphabet, in the right dialect."""
     pat = "".join(rnd.choice(PAT_CHARS) for _ in range(rnd.randint(1, 4)))
     return like_to_glob(pat) if op == "GLOB" else pat
 
 
-def like_to_glob(pat):
+def gen_escaped_pattern(rnd):
+    """A LIKE pattern with an ESCAPE clause, and the escape character.
+
+    The escaped positions are where item 12's five characters were too
+    narrow: a % or _ that means itself rather than a wildcard, and the
+    literals GLOB reads as syntax. SQLite drops the escape in front of an
+    ordinary character and takes the character literally, with no error,
+    so the escape is placed in front of any literal rather than only in
+    front of a wildcard.
+
+    A trailing escape is never generated: SQLite matches nothing at all
+    for that pattern, and no GLOB pattern matches nothing.
+    """
+    esc = rnd.choice(ESCAPE_CHARS)
+    out = []
+    for _ in range(rnd.randint(1, 4)):
+        k = rnd.random()
+        if k < 0.3:
+            out.append(rnd.choice(["%", "_"]))
+        elif k < 0.6:
+            out.append(esc + rnd.choice(["%", "_", esc]))
+        else:
+            out.append(rnd.choice(PAT_LITERALS))
+    return "".join(out), esc
+
+
+def gen_glob_pattern(rnd):
+    """A GLOB pattern with character classes, for the fnmatch comparison.
+
+    Inside the sub-language SQLite and fnmatch agree about, which is
+    narrower than either of them on its own. Three forms are left out
+    because the two implementations really do disagree on them, which the
+    suite measures rather than assumes: an unterminated class, which
+    SQLite never matches and fnmatch reads as a literal [; a class whose
+    first member is !, which fnmatch reads as a negation; and an empty
+    class.
+    """
+    out = []
+    for _ in range(rnd.randint(1, 3)):
+        k = rnd.random()
+        if k < 0.4:
+            out.append(rnd.choice(["a", "b", "c", "*", "?"]))
+            continue
+        neg = "^" if rnd.random() < 0.3 else ""
+        if k < 0.7:
+            members = "".join(rnd.sample(CLASS_CHARS, rnd.randint(1, 3)))
+        else:
+            lo, hi = sorted(rnd.sample(["a", "b", "c"], 2))
+            members = "%s-%s" % (lo, hi)
+        out.append("[%s%s]" % (neg, members))
+    return "".join(out)
+
+
+# How many GLOB patterns the fnmatch comparison puts to one table. More
+# than one because an oracle that asks a single question about a table is
+# weaker than one asking several, and here the question is cheap: a
+# pattern matching none of the eight rows agrees with Python trivially,
+# and three patterns make a trivial agreement three times less likely to
+# be all that happened.
+GLOB_PROBES = 3
+
+
+def gen_glob_patterns(rnd):
+    """The patterns one table is asked about."""
+    return tuple(gen_glob_pattern(rnd) for _ in range(GLOB_PROBES))
+
+
+def glob_literal(c):
+    """One character, spelled so that GLOB reads it as itself.
+
+    A character class containing one member is how glob syntax spells a
+    literal, and it is the only way to spell one for *, ? and the brackets
+    themselves, since GLOB has no escape character. SQLite and fnmatch
+    agree on this form, which the suite checks for every character here.
+    """
+    return "[%s]" % c if c in "*?[]" else c
+
+
+def like_to_glob(pat, escape=None):
     """The same pattern in GLOB's dialect.
 
-    Sound only for patterns over PAT_CHARS -- see the note there. A pattern
-    carrying a *, ? or [ would have those read as metacharacters by GLOB
-    and as literals by LIKE, and the rewrite would change what is matched.
+    LIKE's wildcards are % and _ where GLOB's are * and ?, so the two
+    languages say the same thing under a translation. They do not say it
+    under a pair of string replacements, which is all item 12 did and the
+    reason it had to forbid four characters: the translation has to know
+    which characters are already literal. % and _ are literals to GLOB,
+    and *, ? and [ are syntax to GLOB and literals to LIKE, so those go
+    through glob_literal.
+
+    `escape` is LIKE's ESCAPE character. GLOB has no equivalent, and needs
+    none: an escaped character is a literal, so the escape disappears and
+    the character is spelled out. A trailing escape is refused, because
+    SQLite matches nothing at all for that pattern and no GLOB pattern
+    does.
     """
-    assert not set(pat) & set("*?[]\\"), "pattern is not translatable"
-    return pat.replace("%", "*").replace("_", "?")
+    out = []
+    i = 0
+    while i < len(pat):
+        c = pat[i]
+        if escape is not None and c == escape:
+            assert i + 1 < len(pat), "a trailing escape matches nothing"
+            out.append(glob_literal(pat[i + 1]))
+            i += 2
+            continue
+        out.append("*" if c == "%" else "?" if c == "_" else glob_literal(c))
+        i += 1
+    return "".join(out)
+
+
+def glob_to_fnmatch(pat):
+    """A GLOB pattern in Python's fnmatch dialect.
+
+    The one oracle in this project that is not SQLite. The two languages
+    are the same language apart from how a class is negated: SQLite writes
+    [^abc] and fnmatch writes [!abc], and each reads the other's character
+    as an ordinary member. Everything else, including a class member that
+    is itself a wildcard, agrees between them over the alphabet here.
+
+    The restriction is asserted rather than trusted, the same way the
+    pattern alphabet was in item 12: a class has to be terminated, to be
+    non-empty, and to hold only CLASS_CHARS or a range of them.
+    """
+    out = []
+    i = 0
+    while i < len(pat):
+        if pat[i] != "[":
+            out.append(pat[i])
+            i += 1
+            continue
+        end = pat.find("]", i + 1)
+        assert end > i + 1, "an unterminated or empty class is not translatable"
+        body = pat[i + 1:end]
+        neg = body.startswith("^")
+        members = body[1:] if neg else body
+        assert members, "an empty class is not translatable"
+        ok = set(members) <= set(CLASS_CHARS) or (
+            len(members) == 3 and members[1] == "-"
+            and set(members[0] + members[2]) <= set(CLASS_CHARS))
+        assert ok, "class member outside the agreed alphabet: %r" % members
+        out.append("[%s%s]" % ("!" if neg else "", members))
+        i = end + 1
+    return "".join(out)
 
 
 def lit(rnd, ty):
@@ -932,36 +1080,71 @@ def cmd_agg(args):
 
 # ----------------------------------------------- LIKE against GLOB
 #
-# The only place in this project with a DIFFERENTIAL oracle rather than a
-# metamorphic one, and it needs no second database: SQLite ships two
-# independent pattern matchers, and they can be pointed at each other.
+# The DIFFERENTIAL oracles, where everything above is metamorphic. Two of
+# them, and only the second needs anything outside SQLite.
 #
-# LIKE and GLOB are separate implementations with separate wildcard
-# syntax. Over the restricted alphabet in PAT_CHARS the two languages say
-# the same thing under % -> * and _ -> ?, so:
+# ONE MATCHER AGAINST THE OTHER. SQLite ships two independent pattern
+# matchers with separate wildcard syntax, and the two languages say the
+# same thing under a translation:
 #
 #     SELECT * FROM t WHERE c LIKE 'a%b'
 #     ==  SELECT * FROM t WHERE c GLOB 'a*b'
 #
-# must hold row for row, including for NULL, where both must yield NULL
-# rather than FALSE.
+# row for row, including for NULL, where both must yield NULL rather than
+# FALSE. The translation is the whole difficulty and it is in
+# like_to_glob: % and _ are wildcards to LIKE and literals to GLOB, while
+# *, ? and [ are literals to LIKE and syntax to GLOB. Item 12 refused the
+# second kind. Item 15 translates them, and handles LIKE's ESCAPE clause,
+# which GLOB has no equivalent of and needs none.
 #
-# Two preconditions, and both are enforced rather than hoped for. LIKE
-# folds ASCII case by default and GLOB never does, so the pragma is pinned
-# in connect(). And the rewrite is only valid over PAT_CHARS, which
-# like_to_glob() asserts rather than trusts -- a pattern containing a *, a
-# ? or a [ would be read as a metacharacter by one side and a literal by
-# the other.
+# GLOB AGAINST PYTHON'S FNMATCH. The character classes GLOB has are the
+# one part of the language LIKE cannot express at all, so the comparison
+# above cannot reach them however the pattern is translated. fnmatch is
+# the same glob language and is the only implementation this project
+# compares against that is not SQLite.
+#
+# One precondition, enforced rather than hoped for: LIKE folds ASCII case
+# by default and GLOB never does, so case_sensitive_like=ON is pinned in
+# connect().
 
 
-def like_glob_check(db, col, pat):
+def like_glob_check(db, col, pat, escape=None):
     """The same pattern put to both of SQLite's matchers."""
-    like = rows_of(db, "SELECT * FROM t WHERE %s LIKE '%s'" % (col, pat))
+    esc = "" if escape is None else " ESCAPE '%s'" % escape
+    like = rows_of(db, "SELECT * FROM t WHERE %s LIKE '%s'%s" % (col, pat, esc))
     glob = rows_of(db, "SELECT * FROM t WHERE %s GLOB '%s'"
-                   % (col, like_to_glob(pat)))
+                   % (col, like_to_glob(pat, escape)))
     if like == glob:
         return None
     return ("LIKE/GLOB", len(like), len(glob))
+
+
+def glob_fnmatch_check(db, col, pats):
+    """SQLite's GLOB against Python's fnmatch, row for row.
+
+    The only comparison here against something outside SQLite, and the
+    reason it exists is that GLOB's character classes have no counterpart
+    in LIKE, so the two-matcher oracle cannot reach them whatever it does.
+    fnmatch is the same glob language, and `glob_to_fnmatch` is the one
+    translation between them.
+
+    Values that are NULL are left out of both sides: `c GLOB p` is NULL
+    for a NULL c, so the row is not in the result, and fnmatch has nothing
+    to say about it. The count of values actually classified is what the
+    caller reports, because a column of NULLs would agree with Python
+    about nothing.
+    """
+    vals = [v for (v,) in rows_of(db, "SELECT %s FROM t" % col)
+            if isinstance(v, str)]
+    for pat in pats:
+        got = rows_of(db, "SELECT %s FROM t WHERE %s GLOB '%s'"
+                      % (col, col, pat))
+        want = sorted([(v,) for v in vals
+                       if fnmatch.fnmatchcase(v, glob_to_fnmatch(pat))],
+                      key=repr)
+        if got != want:
+            return ("GLOB/fnmatch on %r" % pat, len(got), len(want))
+    return None
 
 
 def cmd_like(args):
@@ -974,7 +1157,7 @@ def cmd_like(args):
     import random
     rnd = random.Random(args.seed)
     db = connect()
-    found = tested = skipped = split = 0
+    found = tested = skipped = split = classified = 0
 
     for i in range(args.n):
         ddl, cols, rows = build(db, rnd, args.rows, args.null_rate)
@@ -984,10 +1167,17 @@ def cmd_like(args):
             continue
         col = rnd.choice(text)
         pat = gen_pattern(rnd)
+        epat, esc = gen_escaped_pattern(rnd)
+        gpats = gen_glob_patterns(rnd)
         try:
-            bad = like_glob_check(db, col, pat)
+            bad = (like_glob_check(db, col, pat)
+                   or like_glob_check(db, col, epat, esc)
+                   or glob_fnmatch_check(db, col, gpats))
             hit = db.execute("SELECT COUNT(*) FROM t WHERE %s LIKE '%s'"
                              % (col, pat)).fetchone()[0]
+            classified += GLOB_PROBES * sum(
+                1 for (v,) in rows_of(db, "SELECT %s FROM t" % col)
+                if isinstance(v, str))
         except sqlite3.Error:
             skipped += 1
             continue
@@ -996,21 +1186,26 @@ def cmd_like(args):
             split += 1
         if bad:
             found += 1
-            print("FOUND  LIKE/GLOB disagreement on seed step %d" % i)
+            print("FOUND  %s disagreement on seed step %d" % (bad[0], i))
             print("  %s" % ddl)
             for r in rows:
                 print("  INSERT INTO t VALUES (%s);"
                       % ", ".join(sql_literal(v) for v in r))
-            print("  %s LIKE '%s'  vs  %s GLOB '%s'"
-                  % (col, pat, col, like_to_glob(pat)))
-            print("  LIKE returns %d rows, GLOB returns %d" % (bad[1], bad[2]))
+            print("  %s, patterns %r, %r ESCAPE %r and %r"
+                  % (col, pat, epat, esc, gpats))
+            print("  one side returns %d rows, the other %d"
+                  % (bad[1], bad[2]))
             if found >= args.max_reports:
                 break
 
+    # Three comparisons per case, and the third is against fnmatch rather
+    # than against SQLite, so the values it classified are reported: a
+    # column of NULLs would agree with Python about nothing at all.
     print("LIKE vs GLOB: %d queries, %d disagreements, %d skipped, "
-          "%d where the pattern split the table (%.0f%%)"
+          "%d where the pattern split the table (%.0f%%), "
+          "%d values classified against fnmatch"
           % (tested, found, skipped, split,
-             100.0 * split / tested if tested else 0.0))
+             100.0 * split / tested if tested else 0.0, classified))
     return 1 if found else 0
 
 
@@ -1847,6 +2042,15 @@ class Corrupt:
         if k == "group-skew" and "GROUP BY" in sql and "UNION" not in sql \
                 and rows and rows[0][-1] is not None:
             return [rows[0][:-1] + (rows[0][-1] + 1,)] + rows[1:]
+        # GLOB's character-class matcher wrong where its wildcards are
+        # right, and only where the class is NEGATED. LIKE has no classes
+        # at all, so the two-matcher relation cannot reach them whatever
+        # it does, and the only negated class in this program comes out of
+        # gen_glob_pattern, which only the fnmatch comparison uses. The
+        # unfiltered query that comparison reads its values from carries
+        # no GLOB, so it is left alone and the two sides disagree.
+        if k == "globclass-skew" and " GLOB " in sql and "[^" in sql and rows:
+            return rows[:-1]
         # A group's aggregate computed one too high, in a query whose
         # groups were filtered. This is the defect item 14 bought: the
         # relation partitioned HAVING for COUNT(*) alone until then, and a
@@ -1885,7 +2089,8 @@ class Corrupt:
 BUG_KINDS = ["drop-row", "duplicate-row", "null-only", "count-off-by-one",
              "aggregate-skew", "distinct-dup", "group-skew",
              "setop-drop-row", "having-drop-group", "glob-skew",
-             "groupfilter-skew", "view-skew", "having-agg-skew"]
+             "groupfilter-skew", "view-skew", "having-agg-skew",
+             "globclass-skew"]
 
 
 JOIN_BUG_KINDS = ["join-drop-pair", "leftjoin-overpad", "reorder-skew",
@@ -1948,13 +2153,13 @@ def cmd_selftest(args):
     import random
     real = connect()
 
-    print("%-18s %6s %6s %5s %9s %6s %7s %6s %6s"
+    print("%-18s %6s %6s %5s %9s %6s %7s %6s %6s %8s"
           % ("planted bug", "TLP", "NoREC", "agg", "DISTINCT", "GROUP",
-             "HAVING", "LIKE", "VIEW"))
+             "HAVING", "LIKE", "VIEW", "FNMATCH"))
     worst = {}
     for kind in BUG_KINDS:
         hits = dict.fromkeys(("TLP", "NoREC", "agg", "DISTINCT", "GROUP",
-                              "HAVING", "LIKE", "VIEW"), 0)
+                              "HAVING", "LIKE", "VIEW", "FNMATCH"), 0)
         rnd = random.Random(args.seed)
         for _ in range(args.n):
             _, cols, _ = build(real, rnd, args.rows, args.null_rate)
@@ -1999,6 +2204,15 @@ def cmd_selftest(args):
                         hits["LIKE"] += 1
                 except sqlite3.Error:
                     pass
+                # The one column here whose right-hand side is Python
+                # rather than SQLite, so the planted bug can only corrupt
+                # one of the two sides.
+                try:
+                    if glob_fnmatch_check(bent, rnd.choice(text),
+                                          gen_glob_patterns(rnd)):
+                        hits["FNMATCH"] += 1
+                except sqlite3.Error:
+                    pass
             # The view relation needs a filter to sit outside the view and
             # a coin for whether the view body dedupes.
             try:
@@ -2007,7 +2221,7 @@ def cmd_selftest(args):
                     hits["VIEW"] += 1
             except sqlite3.Error:
                 pass
-        print("%-18s %5d%% %5d%% %4d%% %8d%% %5d%% %6d%% %5d%% %5d%%"
+        print("%-18s %5d%% %5d%% %4d%% %8d%% %5d%% %6d%% %5d%% %5d%% %7d%%"
               % (kind,
                  100 * hits["TLP"] // args.n,
                  100 * hits["NoREC"] // args.n,
@@ -2016,7 +2230,8 @@ def cmd_selftest(args):
                  100 * hits["GROUP"] // args.n,
                  100 * hits["HAVING"] // args.n,
                  100 * hits["LIKE"] // args.n,
-                 100 * hits["VIEW"] // args.n))
+                 100 * hits["VIEW"] // args.n,
+                 100 * hits["FNMATCH"] // args.n))
         worst[kind] = max(hits.values())
 
     missed = [k for k, v in worst.items() if v == 0]
