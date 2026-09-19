@@ -853,9 +853,10 @@ A found case is a schema, ten rows and a predicate like
 `((c1 IS NOT NULL OR c0 <= 2) AND NOT (c2 = c0 OR c3 < 'bb'))`. Nobody
 reads that, so an unreduced report is the same as no report.
 
-The shrink is greedy delta debugging over three axes, drop a row, replace
-a predicate with one of its own subtrees, pull a value toward NULL,
-keeping any change that leaves the case still failing.
+The shrink is greedy delta debugging over four axes, drop a row, replace
+a predicate with one of its own subtrees, drop a column from the DDL and
+from every row, pull a value toward NULL, keeping any change that leaves
+the case still failing.
 
 **The only property that matters is soundness: what comes out must still
 fail.** A reducer that shrinks past the bug emits a minimal case that
@@ -865,35 +866,73 @@ reduction asserts it on its own output:
 
 ```
 $ python3 tlp.py reduce --bug null-only
-found at try 2, against the planted bug 'null-only'
+found at try 5, against the planted bug 'null-only'
   rows       10 -> 3
-  predicate  13 nodes -> 1
+  predicate  9 nodes -> 1
+  columns    2 -> 1
 
-CREATE TABLE t (c0 INTEGER, c1 TEXT, c2 INTEGER, c3 TEXT);
-INSERT INTO t VALUES (NULL, NULL, NULL, NULL);
-INSERT INTO t VALUES (NULL, NULL, NULL, NULL);
-INSERT INTO t VALUES (NULL, NULL, NULL, NULL);
--- predicate: c0 IS NULL
+CREATE TABLE t (c1 INTEGER);
+INSERT INTO t VALUES (NULL);
+INSERT INTO t VALUES (NULL);
+INSERT INTO t VALUES (NULL);
+-- predicate: c1 IS NULL
 -- still fails after reduction: True
 ```
 
 That output is worth reading twice. `null-only` is the narrow planted bug:
 it fires only above two rows and only when the predicate itself mentions
 NULL. The reducer was told neither thing, and landed on exactly three rows
-and exactly `c0 IS NULL`. It rediscovered the bug's trigger condition by
+and exactly `c1 IS NULL`. It rediscovered the bug's trigger condition by
 shrinking. A reducer exists to do exactly that.
 
 Because the bugs are planted, their true floors are known, so the suite can
 assert the reducer reaches them, and not merely that it gets smaller:
 
-| planted bug | fires when | floor | reached |
-|---|---|---|---|
-| `drop-row` | partition returns > 3 rows | 4 rows | 4 |
-| `duplicate-row` | any non-empty result | 1 row | 1 |
-| `null-only` | > 2 rows, NULL in the predicate | 3 rows | 3 |
+| planted bug | fires when | floor | rows reached | columns reached |
+|---|---|---|---|---|
+| `drop-row` | partition returns > 3 rows | 4 rows | 4 | 1 |
+| `duplicate-row` | any non-empty result | 1 row | 1 | 1 |
+| `null-only` | > 2 rows, NULL in the predicate | 3 rows | 3 | 1 |
 
 "Smaller than before" would be satisfied by a reducer that drops one row
 and gives up. Hitting the floor is a measurement.
+
+The schema has a floor too, and it is 1 for all three: a predicate reduced
+to one atom mentions one column, and a table needs at least one. Anything
+above that is a column the reader has to rule out by hand.
+
+### Dropping a column is offered blind
+
+A column that part of the predicate still mentions cannot be dropped, and
+nothing here parses the predicate to find out which those are. The trial
+is offered anyway, the query fails with "no such column", and `fails`
+reports that as not failing, so the trial is rejected. One fewer thing to
+keep correct, and the surviving columns keep their names, so the predicate
+goes on referring to the same ones. The suite checks the other direction
+too: every column name left in the reduced predicate is a column that
+survived.
+
+This is also the answer to the open question item 06 left behind, which
+was whether every oracle here assumes a fixed schema. None of them has to.
+`fails` rebuilds the table for each trial, so the schema is fixed for the
+life of a trial rather than of a case, and that is all any oracle depends
+on.
+
+### The report is the product, so the report is what gets run
+
+The reduced case is printed by one function rather than by a run of print
+statements, and the suite executes the SQL in the lines it returns. A
+report quoting the schema from before the reduction is a lie that no
+assertion about the reducer can catch: the reduction would be correct and
+sound and the `CREATE TABLE` would still name columns the case does not
+have. Pointing the command at the unreduced schema turns the suite red on
+the printed `INSERT`s instead.
+
+The last line of the report is this project's one claim about the reducer,
+and a hardcoded `True` in its place passes everything, because the
+reduction really is sound and the honest answer is also `True`. So the
+suite makes the report print the other answer: with `reduce_case` replaced
+by one that shrinks past the bug, the line has to read `False`.
 
 ### The shrink order has to be well-founded
 
@@ -981,10 +1020,11 @@ order is never compared, only sorted multisets, because SQL does not
 promise an order without `ORDER BY` and comparing sequences would report a
 bug every time the planner legitimately changed its mind.
 
-The reducer shrinks rows, the predicate tree and values. It does not
-shrink the SCHEMA: an unused column stays in the `CREATE TABLE` even when
-no surviving part of the predicate mentions it. The worked example above
-shows this happening.
+The reducer shrinks rows, the predicate tree, the schema and values. It
+does not shrink a column's TYPE, so a `TEXT` column holding only NULL
+stays `TEXT` in the reduced DDL, and it drops whole columns only: there is
+no shrinking of a column name, which would make a reduced case harder to
+match against the run that produced it.
 
 `GROUP BY` is partitioned only for `COUNT(*)`, and only on a single
 grouping column. `HAVING` takes one or two grouping columns and carries
@@ -1034,7 +1074,7 @@ equivalent mutant, not a hole.
 
 ```
 $ make test
-193 passed, 0 failed
+210 passed, 0 failed
 ```
 
 No pytest, no network, no dependencies. `sqlite3` is in the standard

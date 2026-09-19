@@ -626,7 +626,7 @@ Not over a join, not over an aggregate, not over another view.
            None` instead of on isinstance(v, str) changes nothing, because
            every caller passes a TEXT column and those hold only strings
            and NULL. An equivalent mutant, not a hole.
-- [ ] 16 the reducer shrinks the schema too
+- [x] 16 the reducer shrinks the schema too
       why: an unused column survives into the reduced CREATE TABLE even
            when nothing in the surviving predicate mentions it, which the
            README shows in its own worked example. Recorded as an open
@@ -634,6 +634,38 @@ Not over a join, not over an aggregate, not over another view.
            a column changes the DDL and not the data, and every oracle
            here assumes a fixed schema for the life of a case, so this item
            is really about whether that assumption has to hold.
+      done: a fourth axis, between the predicate and the values, since the
+           predicate axis is what frees a column up. reduce_case returns
+           the schema as well now and `fails` takes it, because the DDL is
+           part of what a reader has to read.
+      proves: all three planted bugs reduce to a ONE-COLUMN schema, which
+           is the floor: a predicate reduced to one atom mentions one
+           column and a table needs at least one. The row floors are
+           unchanged at 4, 1 and 3, and the worked example in the README
+           is now four lines of SQL rather than a four-column table with
+           three columns nobody needs to read.
+      found: the assumption did not have to hold. `fails` rebuilds the
+           table for every trial, so the schema is fixed for the life of a
+           TRIAL rather than of a case, and no oracle depends on more than
+           that.
+           And the report turned out to be the part worth testing. The
+           printed case is built by one function now and the suite runs
+           the SQL in the lines it returns, because a report quoting the
+           schema from before the reduction is a lie that no assertion
+           about the reducer can catch: the reduction would be sound and
+           the CREATE TABLE would still name columns the case does not
+           have. Pointing the command at the unreduced schema turns the
+           suite red on the printed INSERTs.
+      note: the soundness line was the last survivor. A hardcoded True in
+           place of the computed value passes everything, because the
+           reduction really is sound and True is also the honest answer.
+           The suite now replaces reduce_case with one that shrinks past
+           the bug and requires the line to read False.
+           A column that the predicate still mentions is offered for
+           dropping anyway: the trial query fails with "no such column",
+           which `fails` reports as not failing, so it is rejected. One
+           fewer thing to keep correct than parsing the predicate for
+           names.
 
 ## Found after the sequence above
 
@@ -677,8 +709,9 @@ is a design claim nobody has tested.
   more rows droppable. Neither was the axis that caused trouble. It was
   shrinking VALUES, which needs a well-founded order or the loop runs
   forever.
-- Whether the schema should shrink too. An unused column survives into the
-  reduced CREATE TABLE even when nothing in the surviving predicate
-  mentions it. Cheap to add and it would make reports shorter; left out
-  because dropping a column changes the DDL, not the data, and
-  every oracle here assumes the schema is fixed for the life of a case.
+- RESOLVED by item 16. The schema shrinks, and the assumption behind
+  leaving it out was false: `fails` rebuilds the table for every trial, so
+  the schema is fixed for the life of a trial rather than of a case, which
+  is all any oracle depends on. All three planted bugs reduce to a
+  one-column schema. What the reduction still does not touch is a column's
+  type or its name.

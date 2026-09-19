@@ -682,12 +682,19 @@ def cmd_norec(args):
 # not a nicety here; it is what turns the output into something a person
 # can act on.
 #
-# Greedy delta debugging over three axes, repeated until none of them
+# Greedy delta debugging over four axes, repeated until none of them
 # moves:
 #
 #   rows        drop one, keep the drop if the case still fails
 #   predicate   replace a node with one of its own subtrees
+#   schema      drop a column, from the DDL and from every row
 #   values      pull a literal toward NULL, 0 or the empty string
+#
+# The schema axis was left out until item 16, and the open question
+# attached to it was whether every oracle here assumes a fixed schema. It
+# does not have to: `fails` rebuilds the table for every trial, so the
+# schema is fixed for the life of a TRIAL rather than for the life of a
+# case, and that is all any oracle depends on.
 #
 # The one invariant that matters is SOUNDNESS: whatever comes out must
 # still fail. A reducer that shrinks past the bug produces a minimal case
@@ -729,12 +736,14 @@ def simpler_than(v, ty):
 
 
 def reduce_case(fails, cols, rows, tree):
-    """Shrink (rows, tree) while `fails(rows, predicate_text)` holds.
+    """Shrink (cols, rows, tree) while `fails` holds.
 
-    `fails` rebuilds the table and re-runs the oracle, so this makes no
-    assumption about which oracle found the case or what the bug is.
+    `fails(cols, rows, predicate_text)` rebuilds the table and re-runs the
+    oracle, so this makes no assumption about which oracle found the case
+    or what the bug is. It takes the schema because the schema shrinks
+    too: the DDL is part of what a reader has to read.
     """
-    if not fails(rows, render(tree)):
+    if not fails(cols, rows, render(tree)):
         raise ValueError("the case does not fail, so there is nothing to reduce")
 
     moved = True
@@ -745,7 +754,7 @@ def reduce_case(fails, cols, rows, tree):
         i = 0
         while i < len(rows):
             trial = rows[:i] + rows[i + 1:]
-            if trial and fails(trial, render(tree)):
+            if trial and fails(cols, trial, render(tree)):
                 rows = trial
                 moved = True
             else:
@@ -754,10 +763,31 @@ def reduce_case(fails, cols, rows, tree):
         # Then the predicate, trying the largest subtree first so that one
         # accepted replacement removes as much as possible.
         for sub in sorted(subtrees(tree), key=tree_size, reverse=True):
-            if fails(rows, render(sub)):
+            if fails(cols, rows, render(sub)):
                 tree = sub
                 moved = True
                 break
+
+        # Then the schema, which the predicate axis is what frees up. A
+        # column nothing in the surviving predicate mentions is still in
+        # the CREATE TABLE, and a reader has to satisfy themselves it is
+        # irrelevant before they can ignore it.
+        #
+        # Every column is offered blind rather than parsing the predicate
+        # for names: a predicate that still mentions the column makes the
+        # trial query fail with "no such column", which `fails` reports as
+        # not failing, so the trial is rejected. One fewer thing to keep
+        # correct, and the surviving columns keep their names, so the
+        # predicate goes on referring to the same ones.
+        j = 0
+        while j < len(cols):
+            trial_cols = cols[:j] + cols[j + 1:]
+            trial_rows = [r[:j] + r[j + 1:] for r in rows]
+            if trial_cols and fails(trial_cols, trial_rows, render(tree)):
+                cols, rows = trial_cols, trial_rows
+                moved = True
+            else:
+                j += 1
 
         # Then the values. A value that can be simplified was never part of
         # what made the case fail, and "0" reads better than "3" in a
@@ -767,12 +797,32 @@ def reduce_case(fails, cols, rows, tree):
                 for cand in simpler_than(rows[i][j], ty):
                     trial = list(rows)
                     trial[i] = rows[i][:j] + (cand,) + rows[i][j + 1:]
-                    if fails(trial, render(tree)):
+                    if fails(cols, trial, render(tree)):
                         rows = trial
                         moved = True
                         break
 
-    return rows, tree
+    return cols, rows, tree
+
+
+def reduce_report(try_n, bug, before, cols, rows, tree, still_fails):
+    """The reduced case as the lines the command prints.
+
+    A function rather than a run of print statements because the report is
+    the product here, and a report that quoted the SCHEMA from before the
+    reduction while the reduction was correct would be a lie no assertion
+    about the reducer could catch. The suite runs the SQL in these lines.
+    """
+    return ["found at try %d, against the planted bug %r" % (try_n, bug),
+            "  rows       %d -> %d" % (before[0], len(rows)),
+            "  predicate  %d nodes -> %d" % (before[1], tree_size(tree)),
+            "  columns    %d -> %d" % (before[2], len(cols)),
+            "",
+            "CREATE TABLE t (%s);" % ", ".join("%s %s" % c for c in cols)] + \
+        ["INSERT INTO t VALUES (%s);" % ", ".join(sql_literal(v) for v in r)
+         for r in rows] + \
+        ["-- predicate: %s" % render(tree),
+         "-- still fails after reduction: %s" % still_fails]
 
 
 def cmd_reduce(args):
@@ -790,31 +840,27 @@ def cmd_reduce(args):
         _, cols, rows = build(db, rnd, args.rows, args.null_rate)
         tree = gen_tree(rnd, cols, args.depth)
 
-        def fails(trial_rows, pred, cols=cols):
+        def fails(trial_cols, trial_rows, pred):
             db.execute("DROP TABLE IF EXISTS t")
-            db.execute("CREATE TABLE t (%s)" % ", ".join("%s %s" % c for c in cols))
-            db.executemany("INSERT INTO t VALUES (%s)" % ",".join("?" * len(cols)),
-                           trial_rows)
+            db.execute("CREATE TABLE t (%s)"
+                       % ", ".join("%s %s" % c for c in trial_cols))
+            db.executemany("INSERT INTO t VALUES (%s)"
+                           % ",".join("?" * len(trial_cols)), trial_rows)
             try:
                 return tlp_check(Corrupt(db, args.bug), pred) is not None
             except sqlite3.Error:
                 return False
 
-        if not fails(rows, render(tree)):
+        if not fails(cols, rows, render(tree)):
             continue
 
-        before = (len(rows), tree_size(tree))
-        rows2, tree2 = reduce_case(fails, cols, list(rows), tree)
+        before = (len(rows), tree_size(tree), len(cols))
+        cols2, rows2, tree2 = reduce_case(fails, cols, list(rows), tree)
 
-        print("found at try %d, against the planted bug %r" % (i + 1, args.bug))
-        print("  rows       %d -> %d" % (before[0], len(rows2)))
-        print("  predicate  %d nodes -> %d" % (before[1], tree_size(tree2)))
-        print()
-        print("CREATE TABLE t (%s);" % ", ".join("%s %s" % c for c in cols))
-        for r in rows2:
-            print("INSERT INTO t VALUES (%s);" % ", ".join(sql_literal(v) for v in r))
-        print("-- predicate: %s" % render(tree2))
-        print("-- still fails after reduction: %s" % fails(rows2, render(tree2)))
+        for line in reduce_report(i + 1, args.bug, before, cols2, rows2,
+                                   tree2,
+                                   fails(cols2, rows2, render(tree2))):
+            print(line)
         return 1
 
     print("no case found in %d tries" % args.tries)

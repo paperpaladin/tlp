@@ -13,6 +13,7 @@ reports the conformance of nothing.
 
     python3 t/test_tlp.py
 """
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -455,6 +456,10 @@ check("...and the inner relation never issues a LEFT JOIN, so it cannot", i_pad,
 # Asserting the exact floor rather than "smaller than before" is what turns
 # this from a smoke test into a measurement. "Smaller" is satisfied by a
 # reducer that drops one row and gives up.
+#
+# The schema has a floor too, and it is the same for all three: a predicate
+# reduced to one atom mentions one column, and a table needs at least one,
+# so anything above 1 is a column the reader has to rule out by hand.
 
 def find_and_reduce(kind, seed=3, rows=10, depth=3):
     """Search for a case against a planted bug, then shrink it."""
@@ -464,21 +469,22 @@ def find_and_reduce(kind, seed=3, rows=10, depth=3):
         _, cols, data = tlp.build(db, rnd, rows, 0.25)
         tree = tlp.gen_tree(rnd, cols, depth)
 
-        def fails(trial, pred, cols=cols):
+        def fails(trial_cols, trial, pred):
             db.execute("DROP TABLE IF EXISTS t")
-            db.execute("CREATE TABLE t (%s)" % ", ".join("%s %s" % c for c in cols))
-            db.executemany("INSERT INTO t VALUES (%s)" % ",".join("?" * len(cols)),
-                           trial)
+            db.execute("CREATE TABLE t (%s)"
+                       % ", ".join("%s %s" % c for c in trial_cols))
+            db.executemany("INSERT INTO t VALUES (%s)"
+                           % ",".join("?" * len(trial_cols)), trial)
             try:
                 return tlp.tlp_check(tlp.Corrupt(db, kind), pred) is not None
             except sqlite3.Error:
                 return False
 
-        if not fails(data, tlp.render(tree)):
+        if not fails(cols, data, tlp.render(tree)):
             continue
-        before = (len(data), tlp.tree_size(tree))
-        small, stree = tlp.reduce_case(fails, cols, list(data), tree)
-        return before, small, stree, cols, fails
+        before = (len(data), tlp.tree_size(tree), len(cols))
+        scols, small, stree = tlp.reduce_case(fails, cols, list(data), tree)
+        return before, small, stree, scols, fails
     return None
 
 
@@ -491,29 +497,97 @@ for kind, floor in FLOORS.items():
     before, small, stree, cols, fails = got
     # Soundness. The only property that matters.
     check("%s: the reduced case still fails" % kind,
-          fails(small, tlp.render(stree)), True)
+          fails(cols, small, tlp.render(stree)), True)
     # Effectiveness, against the planted bug's known floor.
     check("%s: shrinks to its true minimum of %d rows" % (kind, floor),
           len(small), floor)
-    ok("%s: predicate %d nodes -> %d, rows %d -> %d"
-       % (kind, before[1], tlp.tree_size(stree), before[0], len(small)))
-    # The report has to be runnable, which means real SQL and not a repr.
+    check("%s: and to a one-column schema, from %d" % (kind, before[2]),
+          len(cols), 1)
+    # A column the predicate no longer mentions cannot be dropped by
+    # accident: the trial query would fail with "no such column", which
+    # `fails` reports as not failing. So every name left in the predicate
+    # has to be a column that survived.
+    named = set(re.findall(r"c\d+", tlp.render(stree)))
+    check("%s: the reduced predicate mentions only surviving columns" % kind,
+          sorted(named - {c for c, _ in cols}), [])
+    check("...and it mentions one, so the line above is not vacuous",
+          len(named), 1)
+    ok("%s: predicate %d nodes -> %d, rows %d -> %d, columns %d -> %d"
+       % (kind, before[1], tlp.tree_size(stree), before[0], len(small),
+          before[2], len(cols)))
+    # The report has to be runnable, which means real SQL and not a repr,
+    # and it is the REPORT that is run rather than SQL the test builds for
+    # itself. Printing the schema from before the reduction survives every
+    # assertion about the reducer, so the lines the command prints are the
+    # thing executed here.
+    report = tlp.reduce_report(1, kind, before, cols, small, stree, True)
     probe = sqlite3.connect(":memory:")
-    ddl = "CREATE TABLE t (%s)" % ", ".join("%s %s" % c for c in cols)
-    probe.execute(ddl)
-    for r in small:
-        probe.execute("INSERT INTO t VALUES (%s)"
-                      % ", ".join(tlp.sql_literal(v) for v in r))
+    for line in report:
+        if line.startswith("CREATE") or line.startswith("INSERT"):
+            probe.execute(line)
     # Counter, not sorted(): a row is a tuple mixing NULL with integers and
     # sorted() raises on that comparison. It is also the right relation --
     # these are multisets, and SQL does not promise an order.
-    check("%s: the printed INSERTs round-trip through sqlite3" % kind,
+    check("%s: the printed report runs, and its rows are the reduced ones"
+          % kind,
           Counter(probe.execute("SELECT * FROM t").fetchall()), Counter(small))
+    check("...and its CREATE TABLE names the reduced schema" ,
+          [l for l in report if l.startswith("CREATE")],
+          ["CREATE TABLE t (%s);" % ", ".join("%s %s" % c for c in cols)])
+
+# And the command's own path, run end to end. The check above calls
+# reduce_report directly, so handing that function the schema from BEFORE
+# the reduction is a wiring mistake only a run of the command can see --
+# and the report is what a person reads, so a CREATE TABLE with columns
+# the reduced case does not have is the one defect here that costs
+# somebody an afternoon.
+import argparse
+import contextlib
+import io
+
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc = tlp.cmd_reduce(argparse.Namespace(bug="null-only", tries=2000,
+                                           seed=0, rows=10, depth=3,
+                                           null_rate=0.25))
+out = buf.getvalue().splitlines()
+check("the reduce command reports a case it found", rc, 1)
+ddl = [l for l in out if l.startswith("CREATE")][0]
+ins = [l for l in out if l.startswith("INSERT")]
+claimed = int([l for l in out if l.startswith("  columns")][0].split("->")[1])
+# Commas count columns here because no generated value contains one: TEXT
+# values are "a", "bb" and "c".
+check("the printed CREATE TABLE holds the number of columns it claims",
+      ddl.count(",") + 1, claimed)
+check("...and every printed INSERT holds that many values",
+      {l.count(",") + 1 for l in ins}, {claimed})
+check("...and the last line says the reduced case still fails",
+      out[-1], "-- still fails after reduction: True")
+
+# The last line of that report is the project's one claim about the
+# reducer, and a hardcoded True in its place survives every check above,
+# because the reduction really is sound and the honest answer is also
+# True. So the report is made to print the other answer: a reducer that
+# shrinks past the bug has to produce "still fails: False" rather than a
+# reassuring line it computed from nothing.
+real_reduce = tlp.reduce_case
+try:
+    tlp.reduce_case = lambda fails, cols, rows, tree: (
+        cols[:1], [rows[0][:1]], ("atom", "1"))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        tlp.cmd_reduce(argparse.Namespace(bug="null-only", tries=2000, seed=0,
+                                          rows=10, depth=3, null_rate=0.25))
+finally:
+    tlp.reduce_case = real_reduce
+check("an over-shrunk case is reported as no longer failing",
+      buf.getvalue().splitlines()[-1],
+      "-- still fails after reduction: False")
 
 # Reducing something that does not fail is a caller error, not a no-op: it
 # would return a "minimal case" for a bug that was never there.
 try:
-    tlp.reduce_case(lambda rows, pred: False, [("c0", "INTEGER")],
+    tlp.reduce_case(lambda cols, rows, pred: False, [("c0", "INTEGER")],
                     [(1,)], ("atom", "c0 = 1"))
     no("reduce_case refuses a case that does not fail")
 except ValueError:
