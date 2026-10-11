@@ -106,21 +106,43 @@ foreign keys, no virtual tables, no window functions.
       proves: 34,353 expressions at depth 2 agree; four wrong truth tables
               are each caught; one rewrite is recorded as an equivalent
               mutant rather than chased.
-- [ ] 01 schema and data generation, with NULLs by construction
+- [x] 01 schema and data generation, with NULLs by construction
       why: a table with no NULLs cannot exercise three-valued logic at all,
            so the NULL rate is a parameter rather than an accident.
-- [ ] 02 the predicate generator, and `tlp vacuity`
+- [x] 02 the predicate generator, and `tlp vacuity`
       why: the generator decides whether any of this means anything, and
            the measurement has to exist before the fuzzer that depends on
            it. Expect the first version to be mostly two-valued.
-- [ ] 03 the TLP oracle
-- [ ] 04 the NoREC oracle
+- [x] 03 the TLP oracle
+- [x] 04 the NoREC oracle
       why: TLP partitions the rows; NoREC attacks the optimiser directly.
            They fail on different bugs and neither subsumes the other.
-- [ ] 05 planted bugs: a wrapper that corrupts results on purpose, so the
+- [x] 05 planted bugs: a wrapper that corrupts results on purpose, so the
       oracles can be watched to fail
       why: this is the only way to know the tool works, since the thing it
            is pointed at is almost certainly correct.
+      done: four bug classes, and the table is the justification for
+            carrying two oracles rather than one:
+              drop-row           TLP 100%,  NoREC 0%
+              duplicate-row      TLP 100%,  NoREC 0%
+              null-only          TLP  23%,  NoREC 0%
+              count-off-by-one   TLP   0%,  NoREC 100%
+            TLP never asks for a count, so it cannot see one that is
+            wrong; NoREC only ever compares two numbers, so it cannot see
+            which rows moved. Neither subsumes the other, measured rather
+            than asserted.
+      found: the narrow bug was not narrow. "null-only" was meant to fire
+            only for predicates mentioning NULL and was written as
+            `"IS NULL" in sql` -- but the partition query ends in
+            `(p) IS NULL` whatever p is, so it fired every time and was
+            caught 100% of the time, exactly like the broad ones. Counting
+            occurrences instead takes it to 23%, which is the honest shape
+            for a narrow bug met by a random generator.
+      note: the NULL rate has an optimum, which was not obvious until it
+            was measured. At 0 nothing is three-valued; at 0.6 the rows
+            are so NULL-heavy that the TRUE and FALSE arms empty out
+            instead and 13% of predicates become constant. 0.25 is the
+            peak at 32%, and the sweep is in the README.
 - [ ] 06 `tlp reduce` -- shrink a failing case to a minimal schema,
       dataset and predicate
       why: an unreduced report is a thousand rows and a predicate nobody
