@@ -105,6 +105,61 @@ hundreds. `COUNT` is the one to stare at: its combiner is `SUM`, and
 writing `COUNT` there by analogy with the others -- the obvious mistake --
 produces a tool that reports a bug in 208 of 210 correct queries.
 
+## Partitioning a join's ON clause
+
+The published work found more bugs here than anywhere else, and the reason
+is worth stating: a `WHERE` predicate is evaluated once per row, but an
+`ON` predicate decides which **pairs** of rows exist at all. Getting it
+wrong changes the shape of the result rather than its contents, and join
+reordering, index selection on the inner side and the outer-join padding
+rules all meet in that one clause.
+
+Every pair in the cross product makes the predicate exactly one of TRUE,
+FALSE or NULL, and an inner join keeps precisely the TRUE pairs -- so the
+three `ON`-partitions are a partition of the cross product:
+
+```sql
+  t1 JOIN t2 ON p
+    UNION ALL t1 JOIN t2 ON NOT p
+    UNION ALL t1 JOIN t2 ON p IS NULL
+==  t1, t2
+```
+
+**The same trick does not work for a `LEFT JOIN`**, which is the part worth
+getting right rather than assuming. Each arm pads its own unmatched rows,
+so the padding is counted three times over. What is true instead is a
+decomposition -- a left join is its inner join plus one row for every left
+row that found no TRUE match anywhere:
+
+```sql
+  COUNT(t1 LEFT JOIN t2 ON p)
+==  COUNT(t1 JOIN t2 ON p)
+  + COUNT(t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE p))
+```
+
+That is a different shape of query from anything else here: `NOT EXISTS`
+is a correlated subquery, and the optimiser rewrites it into something else
+entirely.
+
+```
+$ python3 tlp.py joinselftest
+planted bug               INNER    LEFT JOIN
+join-drop-pair             100%           0%
+leftjoin-overpad             0%         100%
+
+both planted join bugs are caught, and by different relations
+```
+
+Kept as a separate table from the one above rather than folded into it,
+because that would not be an honest comparison: the single-table oracles
+query `t` and these query `t1` and `t2`, so "TLP does not catch this" would
+only mean the two were never pointed at the same thing.
+
+Every generated `ON` predicate is forced to mention both tables. Without
+that it is a filter on one side, the planner pushes it down, and the join
+being tested is not the join it appears to be. 65% of them genuinely split
+the cross product rather than keeping all of it or none.
+
 ## The generator decides whether any of this means anything
 
 TLP splits rows three ways. A predicate that is never NULL leaves the third
@@ -163,10 +218,9 @@ order is never compared, only sorted multisets, because SQL does not
 promise an order without `ORDER BY` and comparing sequences would report a
 bug every time the planner legitimately changed its mind.
 
-Only `WHERE` is partitioned. The published work found the most bugs
-partitioning a **JOIN's `ON` clause**, which is the next item in
-`PLAN.md`. `DISTINCT` and `GROUP BY` partitioning are not implemented
-either.
+`DISTINCT` and `GROUP BY` partitioning are not implemented. Only two
+tables are joined, never three, so join *reordering* -- which is where a
+planner has the most freedom to be wrong -- is barely exercised.
 
 ## The one hand-written thing, and why
 
@@ -194,7 +248,7 @@ equivalent mutant rather than a hole.
 
 ```
 $ make test
-36 passed, 0 failed
+48 passed, 0 failed
 ```
 
 No pytest, no network, no dependencies. `sqlite3` is in the standard

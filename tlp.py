@@ -400,6 +400,169 @@ def cmd_norec(args):
     return run_oracle(args, norec_check, "NoREC")
 
 
+# ------------------------------------------------------ join partitioning
+#
+# The published work found more bugs partitioning a join's ON clause than
+# anywhere else, and the reason is worth stating: a WHERE predicate is
+# evaluated once per row, but an ON predicate decides which PAIRS of rows
+# exist at all, so getting it wrong changes the shape of the result rather
+# than its contents. Join reordering, index selection on the inner side and
+# the outer-join null-padding rules all meet in one clause.
+#
+# Two relations, both derived and checked by hand before anything was built
+# on them rather than taken from the paper on faith.
+#
+# INNER. Every pair in the cross product makes the ON predicate exactly one
+# of TRUE, FALSE or NULL, and an inner join keeps precisely the TRUE pairs.
+# So the three ON-partitions are a partition of the cross product:
+#
+#     t1 JOIN t2 ON p
+#       UNION ALL t1 JOIN t2 ON NOT p
+#       UNION ALL t1 JOIN t2 ON p IS NULL
+#     ==  t1, t2
+#
+# LEFT. The same partitioning does NOT work, because each arm pads its own
+# unmatched rows and the padding is counted three times. What is true is a
+# decomposition: a left join is the inner join plus one row for every left
+# row that found no TRUE match anywhere.
+#
+#     COUNT(t1 LEFT JOIN t2 ON p)
+#     ==  COUNT(t1 JOIN t2 ON p)
+#       + COUNT(t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE p))
+#
+# That is a different shape of query from anything above, which is the
+# point: NOT EXISTS is a correlated subquery and the optimiser rewrites it
+# into something else entirely.
+
+
+def build2(db, rnd, nrows=6, null_rate=0.25):
+    """Two tables whose columns share a value domain, so that a comparison
+    across them is sometimes true. Disjoint domains would make every
+    cross-table predicate FALSE and the join trivially empty."""
+    tables = []
+    for name, prefix in (("t1", "a"), ("t2", "b")):
+        ncols = rnd.randint(2, 3)
+        cols = [("%s%d" % (prefix, i), rnd.choice(["INTEGER", "TEXT"]))
+                for i in range(ncols)]
+        db.execute("DROP TABLE IF EXISTS %s" % name)
+        db.execute("CREATE TABLE %s (%s)" % (name, ", ".join("%s %s" % c for c in cols)))
+        rows = gen_rows(rnd, cols, nrows, null_rate)
+        db.executemany("INSERT INTO %s VALUES (%s)" % (name, ",".join("?" * len(cols))),
+                       rows)
+        tables.append((name, cols, rows))
+    return tables
+
+
+def gen_join_predicate(rnd, t1, t2, depth=2):
+    """A predicate over both tables.
+
+    At least one cross-table comparison is forced. Without that the
+    predicate is a filter on one side that the planner can push down, the
+    join degenerates, and the partitioning tests a much less interesting
+    query than it appears to.
+    """
+    n1, c1, _ = t1
+    n2, c2, _ = t2
+
+    def cross():
+        a, aty = rnd.choice(c1)
+        b, bty = rnd.choice(c2)
+        return "%s.%s %s %s.%s" % (n1, a, rnd.choice(CMP), n2, b)
+
+    def side():
+        name, cols = (n1, c1) if rnd.random() < 0.5 else (n2, c2)
+        col, ty = rnd.choice(cols)
+        if rnd.random() < 0.25:
+            return "%s.%s IS NULL" % (name, col)
+        return "%s.%s %s %s" % (name, col, rnd.choice(CMP), lit(rnd, ty))
+
+    def expr(d):
+        if d <= 0 or rnd.random() < 0.35:
+            return cross() if rnd.random() < 0.6 else side()
+        k = rnd.random()
+        if k < 0.18:
+            return "(NOT %s)" % expr(d - 1)
+        op = "AND" if k < 0.60 else "OR"
+        return "(%s %s %s)" % (expr(d - 1), op, expr(d - 1))
+
+    pred = expr(depth)
+    if ("%s." % n1) not in pred or ("%s." % n2) not in pred:
+        pred = "(%s AND %s)" % (pred, cross())
+    return pred
+
+
+def join_check(db, pred):
+    """The three ON-partitions must reassemble into the cross product."""
+    whole = rows_of(db, "SELECT * FROM t1, t2")
+    parts = rows_of(db,
+                    "SELECT * FROM t1 JOIN t2 ON (%s) "
+                    "UNION ALL SELECT * FROM t1 JOIN t2 ON NOT (%s) "
+                    "UNION ALL SELECT * FROM t1 JOIN t2 ON (%s) IS NULL"
+                    % (pred, pred, pred))
+    if whole == parts:
+        return None
+    return ("JOIN", len(whole), len(parts))
+
+
+def leftjoin_check(db, pred):
+    """A left join is its inner join plus the left rows that matched nothing."""
+    (left,) = db.execute(
+        "SELECT COUNT(*) FROM t1 LEFT JOIN t2 ON (%s)" % pred).fetchone()
+    (inner,) = db.execute(
+        "SELECT COUNT(*) FROM t1 JOIN t2 ON (%s)" % pred).fetchone()
+    (unmatched,) = db.execute(
+        "SELECT COUNT(*) FROM t1 WHERE NOT EXISTS "
+        "(SELECT 1 FROM t2 WHERE (%s))" % pred).fetchone()
+    if left == inner + unmatched:
+        return None
+    return ("LEFT JOIN", left, inner + unmatched)
+
+
+def cmd_join(args):
+    import random
+    rnd = random.Random(args.seed)
+    db = sqlite3.connect(":memory:")
+    found = tested = skipped = interesting = 0
+
+    for i in range(args.n):
+        t1, t2 = build2(db, rnd, args.rows, args.null_rate)
+        if args.index:
+            db.execute("CREATE INDEX IF NOT EXISTS i1 ON t1(%s)" % t1[1][0][0])
+            db.execute("CREATE INDEX IF NOT EXISTS i2 ON t2(%s)" % t2[1][0][0])
+        pred = gen_join_predicate(rnd, t1, t2, args.depth)
+        try:
+            # A join predicate is interesting when it actually splits the
+            # cross product rather than selecting all of it or none.
+            (kept,) = db.execute(
+                "SELECT COUNT(*) FROM t1 JOIN t2 ON (%s)" % pred).fetchone()
+            (total,) = db.execute("SELECT COUNT(*) FROM t1, t2").fetchone()
+            bad = join_check(db, pred) or leftjoin_check(db, pred)
+        except sqlite3.Error:
+            skipped += 1
+            continue
+        tested += 1
+        if 0 < kept < total:
+            interesting += 1
+        if bad:
+            found += 1
+            print("FOUND  %s disagreement at step %d" % (bad[0], i))
+            for name, cols, rows in (t1, t2):
+                print("  CREATE TABLE %s (%s);" %
+                      (name, ", ".join("%s %s" % c for c in cols)))
+                for r in rows:
+                    print("    INSERT INTO %s VALUES %r;" % (name, (r,)))
+            print("  ON %s" % pred)
+            print("  %r against %r" % (bad[1], bad[2]))
+            if found >= args.max_reports:
+                break
+
+    print("join: %d queries, %d disagreements, %d skipped, "
+          "%d split the cross product (%.0f%%)"
+          % (tested, found, skipped, interesting,
+             100.0 * interesting / tested if tested else 0.0))
+    return 1 if found else 0
+
+
 # ------------------------------------------------- aggregate partitioning
 #
 # Row-level TLP asks whether the partitions hold the same ROWS. This asks
@@ -573,11 +736,62 @@ class Corrupt:
                 and "FROM (" not in sql and "UNION" not in sql \
                 and rows and rows[0][0] is not None:
             return [(rows[0][0] + 1,)]
+        # A pair lost from the ON-partitioning. Only the inner-join
+        # relation looks at those rows.
+        if k == "join-drop-pair" and "JOIN t2 ON" in sql and "UNION ALL" in sql \
+                and len(rows) > 3:
+            return rows[:-1]
+        # An outer join that pads one row too many. The inner-join relation
+        # never issues a LEFT JOIN, so it cannot see this at all.
+        if k == "leftjoin-overpad" and "LEFT JOIN" in sql and rows \
+                and rows[0][0] is not None:
+            return [(rows[0][0] + 1,)]
         return rows
 
 
 BUG_KINDS = ["drop-row", "duplicate-row", "null-only", "count-off-by-one",
              "aggregate-skew"]
+
+
+JOIN_BUG_KINDS = ["join-drop-pair", "leftjoin-overpad"]
+
+
+def cmd_joinselftest(args):
+    """The same argument as `selftest`, for the two join relations.
+
+    Kept separate rather than folded into that table because it would not
+    be an honest comparison: the single-table oracles query `t` and these
+    query `t1` and `t2`, so "TLP does not catch this" would only mean the
+    two were never pointed at the same thing. What is worth measuring is
+    whether the two JOIN relations catch different bugs, and they do.
+    """
+    import random
+    real = sqlite3.connect(":memory:")
+    print("%-20s %10s %12s" % ("planted bug", "INNER", "LEFT JOIN"))
+    missed = []
+    for kind in JOIN_BUG_KINDS:
+        hits = {"inner": 0, "left": 0}
+        rnd = random.Random(args.seed)
+        for _ in range(args.n):
+            t1, t2 = build2(real, rnd, args.rows, args.null_rate)
+            pred = gen_join_predicate(rnd, t1, t2, args.depth)
+            bent = Corrupt(real, kind)
+            for name, fn in (("inner", join_check), ("left", leftjoin_check)):
+                try:
+                    if fn(bent, pred):
+                        hits[name] += 1
+                except sqlite3.Error:
+                    pass
+        print("%-20s %9d%% %11d%%" % (kind,
+                                      100 * hits["inner"] // args.n,
+                                      100 * hits["left"] // args.n))
+        if max(hits.values()) == 0:
+            missed.append(kind)
+    if missed:
+        print("\nNOT CAUGHT: %s" % ", ".join(missed))
+        return 1
+    print("\nboth planted join bugs are caught, and by different relations")
+    return 0
 
 
 def cmd_selftest(args):
@@ -665,6 +879,17 @@ def main():
         q.add_argument("--max-reports", type=int, default=3, dest="max_reports")
         q.set_defaults(fn=fn)
 
+    p = sub.add_parser("join", help="partition a join's ON clause")
+    p.add_argument("--n", type=int, default=400)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--rows", type=int, default=6)
+    p.add_argument("--depth", type=int, default=2)
+    p.add_argument("--null-rate", type=float, default=0.25, dest="null_rate")
+    p.add_argument("--index", action="store_true", default=True)
+    p.add_argument("--no-index", action="store_false", dest="index")
+    p.add_argument("--max-reports", type=int, default=3, dest="max_reports")
+    p.set_defaults(fn=cmd_join)
+
     p = sub.add_parser("agg", help="aggregate partitioning")
     p.add_argument("--n", type=int, default=400)
     p.add_argument("--seed", type=int, default=0)
@@ -673,6 +898,14 @@ def main():
     p.add_argument("--null-rate", type=float, default=0.25, dest="null_rate")
     p.add_argument("--max-reports", type=int, default=3, dest="max_reports")
     p.set_defaults(fn=cmd_agg)
+
+    p = sub.add_parser("joinselftest", help="plant join bugs, check the relations notice")
+    p.add_argument("--n", type=int, default=150)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--rows", type=int, default=6)
+    p.add_argument("--depth", type=int, default=2)
+    p.add_argument("--null-rate", type=float, default=0.25, dest="null_rate")
+    p.set_defaults(fn=cmd_joinselftest)
 
     p = sub.add_parser("selftest", help="plant bugs and check the oracles notice")
     p.add_argument("--n", type=int, default=200)
