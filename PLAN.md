@@ -151,7 +151,8 @@ foreign keys, no virtual tables, no window functions.
             was measured. At 0 nothing is three-valued; at 0.6 the rows
             are so NULL-heavy that the TRUE and FALSE arms empty out
             instead and 13% of predicates become constant. 0.25 is the
-            peak at 32%, and the sweep is in the README.
+            peak at 29%, and the sweep is in the README. (It read 32% until
+            item 12 put pattern matching into the shared generator.)
 - [x] 06 `tlp reduce` -- shrink a failing case to a minimal schema,
       dataset and predicate
       why: an unreduced report is a thousand rows and a predicate nobody
@@ -365,7 +366,7 @@ foreign keys, no virtual tables, no window functions.
             planted-bug table is the first thing in that file and would
             otherwise read as measuring more than it does.
       found: the vacuity is structurally capped, not merely low. The
-            generator reaches 18% three-valued against the row level's 32%,
+            generator reaches 18% three-valued against the row level's 29%,
             and an eight-row table has about 3.9 groups -- splitting four
             things three ways without emptying an arm is harder than
             splitting eight. Measured rather than excused.

@@ -222,211 +222,6 @@ relation would be false for every table containing one. The suite checks
 all three operators directly rather than trusting that reading of the
 standard.
 
-## Partitioning a join's ON clause
-
-The published work found more bugs here than anywhere else, and the reason
-is worth stating: a `WHERE` predicate is evaluated once per row, but an
-`ON` predicate decides which **pairs** of rows exist at all. Getting it
-wrong changes the shape of the result rather than its contents, and join
-reordering, index selection on the inner side and the outer-join padding
-rules all meet in that one clause.
-
-Every pair in the cross product makes the predicate exactly one of TRUE,
-FALSE or NULL, and an inner join keeps precisely the TRUE pairs -- so the
-three `ON`-partitions are a partition of the cross product:
-
-```sql
-  t1 JOIN t2 ON p
-    UNION ALL t1 JOIN t2 ON NOT p
-    UNION ALL t1 JOIN t2 ON p IS NULL
-==  t1, t2
-```
-
-**The same trick does not work for a `LEFT JOIN`**, which is the part worth
-getting right rather than assuming. Each arm pads its own unmatched rows,
-so the padding is counted three times over. What is true instead is a
-decomposition -- a left join is its inner join plus one row for every left
-row that found no TRUE match anywhere:
-
-```sql
-  COUNT(t1 LEFT JOIN t2 ON p)
-==  COUNT(t1 JOIN t2 ON p)
-  + COUNT(t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE p))
-```
-
-That is a different shape of query from anything else here: `NOT EXISTS`
-is a correlated subquery, and the optimiser rewrites it into something else
-entirely.
-
-```
-$ python3 tlp.py joinselftest
-planted bug             INNER  LEFT JOIN    JOIN3   REORDER
-join-drop-pair           100%         0%      48%        0%
-leftjoin-overpad           0%       100%       0%        0%
-reorder-skew               0%         0%       0%       30%
-
-every planted join bug is caught, and by different relations
-```
-
-Kept as a separate table from the one above rather than folded into it,
-because that would not be an honest comparison: the single-table oracles
-query `t` and these query `t1`, `t2` and `t3`, so "TLP does not catch this"
-would only mean the two were never pointed at the same thing. The four join
-relations *are* all pointed at the same three tables, so that table is a
-real comparison between them.
-
-Every generated `ON` predicate is forced to mention both tables. Without
-that it is a filter on one side, the planner pushes it down, and the join
-being tested is not the join it appears to be. 65% of them genuinely split
-the cross product rather than keeping all of it or none.
-
-## Shrinking a case to something a human will read
-
-A found case is a schema, ten rows and a predicate like
-`((c1 IS NOT NULL OR c0 <= 2) AND NOT (c2 = c0 OR c3 < 'bb'))`. Nobody
-reads that, so an unreduced report is the same as no report.
-
-The shrink is greedy delta debugging over three axes -- drop a row, replace
-a predicate with one of its own subtrees, pull a value toward NULL --
-keeping any change that leaves the case still failing.
-
-**The only property that matters is soundness: what comes out must still
-fail.** A reducer that shrinks past the bug emits a minimal case that
-reproduces nothing and sends whoever reads it hunting for a bug that is not
-there, which is strictly worse than printing the unreduced version. Every
-reduction asserts it on its own output:
-
-```
-$ python3 tlp.py reduce --bug null-only
-found at try 2, against the planted bug 'null-only'
-  rows       10 -> 3
-  predicate  13 nodes -> 1
-
-CREATE TABLE t (c0 INTEGER, c1 TEXT, c2 INTEGER, c3 TEXT);
-INSERT INTO t VALUES (NULL, NULL, NULL, NULL);
-INSERT INTO t VALUES (NULL, NULL, NULL, NULL);
-INSERT INTO t VALUES (NULL, NULL, NULL, NULL);
--- predicate: c0 IS NULL
--- still fails after reduction: True
-```
-
-That output is worth reading twice. `null-only` is the narrow planted bug:
-it fires only above two rows and only when the predicate itself mentions
-NULL. The reducer was told neither thing, and landed on exactly three rows
-and exactly `c0 IS NULL`. It rediscovered the bug's trigger condition by
-shrinking, which is what a reducer is for.
-
-Because the bugs are planted, their true floors are known, so the suite can
-assert the reducer reaches them rather than merely getting smaller:
-
-| planted bug | fires when | floor | reached |
-|---|---|---|---|
-| `drop-row` | partition returns > 3 rows | 4 rows | 4 |
-| `duplicate-row` | any non-empty result | 1 row | 1 |
-| `null-only` | > 2 rows, NULL in the predicate | 3 rows | 3 |
-
-"Smaller than before" would be satisfied by a reducer that drops one row
-and gives up. Hitting the floor is a measurement.
-
-### The shrink order has to be well-founded
-
-The value axis looks like the easy one and is the only part that went
-wrong. The first version offered every value NULL and 0 as candidates,
-counted any accepted swap as progress, and **never terminated**: NULL
-became 0, then 0 became NULL, forever, each step looking locally like an
-improvement.
-
-So candidates are now strictly below the current value on a total order --
-NULL, then 0 or the empty string, then everything else -- and the suite
-asserts no candidate leads back to the value it replaced. Deleting the
-strictness makes the test run hang rather than fail, which is the honest
-way for that mutation to show up.
-
-## A third table, so the planner finally has a choice
-
-Two tables give a planner one join and two orders to do it in. Three give
-it a real choice, and **reordering is where a planner has the most freedom
-to be wrong** -- which is why, for as long as only two tables existed here,
-this file had to admit that the most interesting thing about joins was
-barely being exercised.
-
-The `ON`-partitioning carries over directly, with the left side of the
-partitioned join now a join itself:
-
-```sql
-  t1 JOIN t2 ON p12 JOIN t3 ON p
-    UNION ALL t1 JOIN t2 ON p12 JOIN t3 ON NOT p
-    UNION ALL t1 JOIN t2 ON p12 JOIN t3 ON p IS NULL
-==  t1 JOIN t2 ON p12 JOIN t3 ON 1
-```
-
-The new relation is the one that could not exist with two tables. SQLite
-documents `CROSS JOIN` as **suppressing its own reordering**: the tables
-are visited in the order written. So the same query written both ways must
-return the same multiset, and the planner's choice is being differenced
-against a fixed order:
-
-```sql
-    SELECT * FROM t1 JOIN t2 JOIN t3 WHERE p
-==  SELECT * FROM t1 CROSS JOIN t2 CROSS JOIN t3 WHERE p
-```
-
-The two forms reach genuinely different machinery. Asked what it decided,
-SQLite answers:
-
-```
-  free  : SCAN t1 | SCAN t3 | BLOOM FILTER ON t2 (b1=?) | SEARCH t2 USING AUTOMATIC COVERING INDEX (b1=?)
-  forced: SCAN t1 | BLOOM FILTER ON t2 (b1=?) | SEARCH t2 USING AUTOMATIC COVERING INDEX (b1=?) | SCAN t3
-```
-
-Different visit order, and an automatic covering index and a Bloom filter
-built at a different point in the plan.
-
-### The relation is worth nothing when the plans agree
-
-In the runs where SQLite picks the same order both ways, this compares a
-query against itself. So the fraction where it actually reordered is
-measured and reported, the same way the three-valued fraction is:
-
-```
-$ python3 tlp.py join3 --n 400
-three-table joins: 400 queries, 0 disagreements, 0 skipped,
-                   247 where the planner chose a different order (62%)
-```
-
-And because the whole relation rests on `CROSS JOIN` pinning the order, the
-suite asks `EXPLAIN QUERY PLAN` whether it really does, rather than taking
-it from the documentation.
-
-### A lever that did not survive being measured properly
-
-This is worth recording because the mistake was mine and it passed a test.
-
-A minimal probe -- three tables, two cross-table comparisons, nothing else
--- said that equality predicates and an index were what made the planner
-reorder, moving the rate from **15% to 67%**. Both looked decisive, and the
-generator was built around them.
-
-On the shipped generator they are not decisive at all:
-
-| | reordering rate |
-|---|---|
-| as shipped | ~60% |
-| without the equality bias | 1 to 6 points lower |
-| without the index | 6 to 11 points lower |
-| without either | 15 to 19 points lower |
-
-Both still point the same way on every seed tried, and together they are
-worth something. But the 50-point effect the probe reported did not
-transfer, because the real generator's predicates already carry several
-cross-table comparisons and the planner has reasons to reorder with or
-without the help.
-
-The test written to assert the equality lever **passed on noise**: 58%
-against 64% at 200 cases, which is 61% against 60% at 500. What is asserted
-now is the combined effect, whose margin is 15 to 19 points; the individual
-rates are printed without an assertion the sample size cannot support.
-
 ## HAVING partitions groups, so the rule is different a third time
 
 A `WHERE` predicate decides which **rows** survive. An `ON` predicate
@@ -527,11 +322,154 @@ command whose NULL-rate default is 0.40 rather than 0.25, because a group
 goes NULL only when **every** value in it is NULL, which takes more NULLs
 than making one row's predicate go NULL.
 
-18% is far below the row-level 32%, and the reason is structural rather
+18% is far below the row-level 29%, and the reason is structural rather
 than fixable: an eight-row table has about **3.9 groups**, and splitting
 four things three ways without leaving an arm empty is simply harder than
 splitting eight. The right comparison for this number is not the row-level
 one.
+
+## Partitioning a join's ON clause
+
+The published work found more bugs here than anywhere else, and the reason
+is worth stating: a `WHERE` predicate is evaluated once per row, but an
+`ON` predicate decides which **pairs** of rows exist at all. Getting it
+wrong changes the shape of the result rather than its contents, and join
+reordering, index selection on the inner side and the outer-join padding
+rules all meet in that one clause.
+
+Every pair in the cross product makes the predicate exactly one of TRUE,
+FALSE or NULL, and an inner join keeps precisely the TRUE pairs -- so the
+three `ON`-partitions are a partition of the cross product:
+
+```sql
+  t1 JOIN t2 ON p
+    UNION ALL t1 JOIN t2 ON NOT p
+    UNION ALL t1 JOIN t2 ON p IS NULL
+==  t1, t2
+```
+
+**The same trick does not work for a `LEFT JOIN`**, which is the part worth
+getting right rather than assuming. Each arm pads its own unmatched rows,
+so the padding is counted three times over. What is true instead is a
+decomposition -- a left join is its inner join plus one row for every left
+row that found no TRUE match anywhere:
+
+```sql
+  COUNT(t1 LEFT JOIN t2 ON p)
+==  COUNT(t1 JOIN t2 ON p)
+  + COUNT(t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE p))
+```
+
+That is a different shape of query from anything else here: `NOT EXISTS`
+is a correlated subquery, and the optimiser rewrites it into something else
+entirely.
+
+```
+$ python3 tlp.py joinselftest
+planted bug             INNER  LEFT JOIN    JOIN3   REORDER
+join-drop-pair           100%         0%      48%        0%
+leftjoin-overpad           0%       100%       0%        0%
+reorder-skew               0%         0%       0%       30%
+
+every planted join bug is caught, and by different relations
+```
+
+Kept as a separate table from the one above rather than folded into it,
+because that would not be an honest comparison: the single-table oracles
+query `t` and these query `t1`, `t2` and `t3`, so "TLP does not catch this"
+would only mean the two were never pointed at the same thing. The four join
+relations *are* all pointed at the same three tables, so that table is a
+real comparison between them.
+
+Every generated `ON` predicate is forced to mention both tables. Without
+that it is a filter on one side, the planner pushes it down, and the join
+being tested is not the join it appears to be. 65% of them genuinely split
+the cross product rather than keeping all of it or none.
+
+## A third table, so the planner finally has a choice
+
+Two tables give a planner one join and two orders to do it in. Three give
+it a real choice, and **reordering is where a planner has the most freedom
+to be wrong** -- which is why, for as long as only two tables existed here,
+this file had to admit that the most interesting thing about joins was
+barely being exercised.
+
+The `ON`-partitioning carries over directly, with the left side of the
+partitioned join now a join itself:
+
+```sql
+  t1 JOIN t2 ON p12 JOIN t3 ON p
+    UNION ALL t1 JOIN t2 ON p12 JOIN t3 ON NOT p
+    UNION ALL t1 JOIN t2 ON p12 JOIN t3 ON p IS NULL
+==  t1 JOIN t2 ON p12 JOIN t3 ON 1
+```
+
+The new relation is the one that could not exist with two tables. SQLite
+documents `CROSS JOIN` as **suppressing its own reordering**: the tables
+are visited in the order written. So the same query written both ways must
+return the same multiset, and the planner's choice is being differenced
+against a fixed order:
+
+```sql
+    SELECT * FROM t1 JOIN t2 JOIN t3 WHERE p
+==  SELECT * FROM t1 CROSS JOIN t2 CROSS JOIN t3 WHERE p
+```
+
+The two forms reach genuinely different machinery. Asked what it decided,
+SQLite answers:
+
+```
+  free  : SCAN t1 | SCAN t3 | BLOOM FILTER ON t2 (b1=?) | SEARCH t2 USING AUTOMATIC COVERING INDEX (b1=?)
+  forced: SCAN t1 | BLOOM FILTER ON t2 (b1=?) | SEARCH t2 USING AUTOMATIC COVERING INDEX (b1=?) | SCAN t3
+```
+
+Different visit order, and an automatic covering index and a Bloom filter
+built at a different point in the plan.
+
+### The relation is worth nothing when the plans agree
+
+In the runs where SQLite picks the same order both ways, this compares a
+query against itself. So the fraction where it actually reordered is
+measured and reported, the same way the three-valued fraction is:
+
+```
+$ python3 tlp.py join3 --n 400
+three-table joins: 400 queries, 0 disagreements, 0 skipped,
+                   247 where the planner chose a different order (62%)
+```
+
+And because the whole relation rests on `CROSS JOIN` pinning the order, the
+suite asks `EXPLAIN QUERY PLAN` whether it really does, rather than taking
+it from the documentation.
+
+### A lever that did not survive being measured properly
+
+This is worth recording because the mistake was mine and it passed a test.
+
+A minimal probe -- three tables, two cross-table comparisons, nothing else
+-- said that equality predicates and an index were what made the planner
+reorder, moving the rate from **15% to 67%**. Both looked decisive, and the
+generator was built around them.
+
+On the shipped generator they are not decisive at all:
+
+| | reordering rate |
+|---|---|
+| as shipped | ~60% |
+| without the equality bias | 1 to 6 points lower |
+| without the index | 6 to 11 points lower |
+| without either | 15 to 19 points lower |
+
+Both still point the same way on every seed tried, and together they are
+worth something. But the 50-point effect the probe reported did not
+transfer, because the real generator's predicates already carry several
+cross-table comparisons and the planner has reasons to reorder with or
+without the help.
+
+The test written to assert the equality lever **passed on noise**: 58%
+against 64% at 200 cases, which is 61% against 60% at 500. What is asserted
+now is the combined effect, whose margin is 15 to 19 points; the individual
+rates are printed without an assertion the sample size cannot support.
 
 ## Two pattern matchers, pointed at each other
 
@@ -590,6 +528,68 @@ predicates every other oracle partitions -- about 1 predicate in 4. That
 moved every measured number in this file slightly, which is how the
 README-consistency check in the suite earned its place: it went red on the
 composition tables the moment the generator changed.
+
+## Shrinking a case to something a human will read
+
+A found case is a schema, ten rows and a predicate like
+`((c1 IS NOT NULL OR c0 <= 2) AND NOT (c2 = c0 OR c3 < 'bb'))`. Nobody
+reads that, so an unreduced report is the same as no report.
+
+The shrink is greedy delta debugging over three axes -- drop a row, replace
+a predicate with one of its own subtrees, pull a value toward NULL --
+keeping any change that leaves the case still failing.
+
+**The only property that matters is soundness: what comes out must still
+fail.** A reducer that shrinks past the bug emits a minimal case that
+reproduces nothing and sends whoever reads it hunting for a bug that is not
+there, which is strictly worse than printing the unreduced version. Every
+reduction asserts it on its own output:
+
+```
+$ python3 tlp.py reduce --bug null-only
+found at try 2, against the planted bug 'null-only'
+  rows       10 -> 3
+  predicate  13 nodes -> 1
+
+CREATE TABLE t (c0 INTEGER, c1 TEXT, c2 INTEGER, c3 TEXT);
+INSERT INTO t VALUES (NULL, NULL, NULL, NULL);
+INSERT INTO t VALUES (NULL, NULL, NULL, NULL);
+INSERT INTO t VALUES (NULL, NULL, NULL, NULL);
+-- predicate: c0 IS NULL
+-- still fails after reduction: True
+```
+
+That output is worth reading twice. `null-only` is the narrow planted bug:
+it fires only above two rows and only when the predicate itself mentions
+NULL. The reducer was told neither thing, and landed on exactly three rows
+and exactly `c0 IS NULL`. It rediscovered the bug's trigger condition by
+shrinking, which is what a reducer is for.
+
+Because the bugs are planted, their true floors are known, so the suite can
+assert the reducer reaches them rather than merely getting smaller:
+
+| planted bug | fires when | floor | reached |
+|---|---|---|---|
+| `drop-row` | partition returns > 3 rows | 4 rows | 4 |
+| `duplicate-row` | any non-empty result | 1 row | 1 |
+| `null-only` | > 2 rows, NULL in the predicate | 3 rows | 3 |
+
+"Smaller than before" would be satisfied by a reducer that drops one row
+and gives up. Hitting the floor is a measurement.
+
+### The shrink order has to be well-founded
+
+The value axis looks like the easy one and is the only part that went
+wrong. The first version offered every value NULL and 0 as candidates,
+counted any accepted swap as progress, and **never terminated**: NULL
+became 0, then 0 became NULL, forever, each step looking locally like an
+improvement.
+
+So candidates are now strictly below the current value on a total order --
+NULL, then 0 or the empty string, then everything else -- and the suite
+asserts no candidate leads back to the value it replaced. Deleting the
+strictness makes the test run hang rather than fail, which is the honest
+way for that mutation to show up.
 
 ## The generator decides whether any of this means anything
 
