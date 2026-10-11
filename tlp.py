@@ -847,6 +847,223 @@ def cmd_agg(args):
     return 1 if found else 0
 
 
+# ------------------------------------------- three tables, and reordering
+#
+# Two tables give a planner almost no freedom: there is one join to do and
+# two orders to do it in. Three give it a real choice, and reordering is
+# where a planner has the most room to be wrong -- which is why the README
+# admitted, for as long as only two tables existed here, that the most
+# interesting thing about joins was barely being exercised.
+#
+# Two relations, and the second is the one that could not exist before.
+#
+# ON-PARTITIONING, now over a join rather than a table. The left side of
+# the partitioned join is itself `t1 JOIN t2 ON p12`, so every pair in the
+# cross product of THAT with t3 makes the predicate one of three values:
+#
+#     t1 JOIN t2 ON p12 JOIN t3 ON p
+#       UNION ALL t1 JOIN t2 ON p12 JOIN t3 ON NOT p
+#       UNION ALL t1 JOIN t2 ON p12 JOIN t3 ON p IS NULL
+#     ==  t1 JOIN t2 ON p12 JOIN t3 ON 1
+#
+# REORDERING. SQLite documents CROSS JOIN as suppressing its own
+# reordering: the tables are visited in the order written. So the same
+# query written both ways must return the same multiset, and the two forms
+# genuinely reach different machinery -- the free form was observed
+# choosing t1, t3, t2 and building an automatic covering index and a Bloom
+# filter where the forced form scanned t3 last and did neither.
+#
+#     SELECT * FROM t1 JOIN t2 JOIN t3 WHERE p         -- planner chooses
+#     ==  SELECT * FROM t1 CROSS JOIN t2 CROSS JOIN t3 WHERE p
+#
+# That relation is only worth anything when the two plans actually differ,
+# and whether they do is a property of the generator rather than of the
+# idea, so it is measured rather than hoped for: `plans_differ` asks SQLite
+# which order it chose, and the shipped generator reorders about 60% of the
+# time.
+#
+# A caution attached to that number, because getting it wrong is easy and
+# I did. A minimal probe -- two cross-table comparisons and nothing else --
+# said equality predicates and an index were worth 15% against 67%, which
+# made both look decisive. ON THE SHIPPED GENERATOR THEY ARE NOT: removing
+# equality costs 1 to 6 points and removing the index 6 to 11, measured
+# over four seeds. Both still point the same way on every seed, and
+# together they are worth 15 to 19, but the lever a simplified probe
+# identified did not transfer at its measured size, because the real
+# predicates already carry several cross-table comparisons and the planner
+# has reasons to reorder with or without the help.
+
+
+def build3(db, rnd, nrows=6, null_rate=0.25, index=True):
+    """Three tables over a shared value domain, indexed by default.
+
+    Indexed because it is the stronger of the two levers on how often the
+    planner actually reorders: dropping the index costs 6 to 11 points of
+    reordering rate, and dropping it together with the equality bias costs
+    15 to 19. Neither is decisive on its own.
+    """
+    specs = []
+    for name, prefix in (("t1", "a"), ("t2", "b"), ("t3", "c")):
+        ncols = rnd.randint(2, 3)
+        cols = [("%s%d" % (prefix, i), rnd.choice(["INTEGER", "TEXT"]))
+                for i in range(ncols)]
+        db.execute("DROP TABLE IF EXISTS %s" % name)
+        db.execute("CREATE TABLE %s (%s)"
+                   % (name, ", ".join("%s %s" % c for c in cols)))
+        rows = gen_rows(rnd, cols, nrows, null_rate)
+        db.executemany("INSERT INTO %s VALUES (%s)"
+                       % (name, ",".join("?" * len(cols))), rows)
+        if index:
+            db.execute("CREATE INDEX IF NOT EXISTS i_%s ON %s(%s)"
+                       % (name, name, cols[0][0]))
+        specs.append((name, cols, rows))
+    return specs
+
+
+# How often a cross-table comparison is "=" rather than one of the other
+# five operators. Equality is what a planner can turn into an index lookup,
+# so it is the kind of join predicate real queries are mostly made of, and
+# that is reason enough to favour it.
+#
+# It is NOT, on this generator, what makes the planner reorder, and the
+# comment here said otherwise until the effect was measured at a usable
+# sample size. Setting it to 0.0 drops the reordering rate by 1 to 6 points
+# across four seeds -- consistent in direction, far too small to call
+# load-bearing, and small enough that a 200-case check of it passed on
+# noise.
+P_JOIN_EQ = 0.6
+
+
+def gen_join3_predicate(rnd, specs, depth=2):
+    """A predicate chaining t1 to t2 to t3.
+
+    Chained rather than starred on t1, so that no single table joins
+    directly to both others -- that is the shape where the order actually
+    matters, because t1 and t3 have nothing to say to each other except
+    through t2.
+    """
+    def cross(x, y):
+        a, _ = rnd.choice(specs[x][1])
+        b, _ = rnd.choice(specs[y][1])
+        op = "=" if rnd.random() < P_JOIN_EQ else rnd.choice(CMP)
+        return "%s.%s %s %s.%s" % (specs[x][0], a, op, specs[y][0], b)
+
+    def side():
+        i = rnd.randrange(3)
+        name, cols, _ = specs[i]
+        col, ty = rnd.choice(cols)
+        if rnd.random() < 0.25:
+            return "%s.%s IS NULL" % (name, col)
+        return "%s.%s %s %s" % (name, col, rnd.choice(CMP), lit(rnd, ty))
+
+    def expr(d):
+        if d <= 0 or rnd.random() < 0.35:
+            return cross(rnd.randrange(2), rnd.randrange(2) + 1) \
+                if rnd.random() < 0.7 else side()
+        k = rnd.random()
+        if k < 0.15:
+            return "(NOT %s)" % expr(d - 1)
+        return "(%s %s %s)" % (expr(d - 1), "AND" if k < 0.65 else "OR",
+                               expr(d - 1))
+
+    pred = expr(depth)
+    # Every table must appear, or this is a two-table join with a spectator
+    # and the third table only multiplies the row count.
+    missing = [i for i in range(3) if ("%s." % specs[i][0]) not in pred]
+    if missing:
+        pred = "(%s AND %s AND %s)" % (pred, cross(0, 1), cross(1, 2))
+    return pred
+
+
+def join3_check(db, pred, p12="t1.a0 = t2.b0"):
+    """ON-partitioning where the left side of the join is itself a join."""
+    base = "SELECT * FROM t1 JOIN t2 ON (%s) JOIN t3 ON " % p12
+    whole = rows_of(db, base + "1")
+    parts = rows_of(db, " UNION ALL ".join(
+        base + arm for arm in ("(%s)" % pred, "NOT (%s)" % pred,
+                               "(%s) IS NULL" % pred)))
+    if whole == parts:
+        return None
+    return ("JOIN3", len(whole), len(parts))
+
+
+def reorder_check(db, pred):
+    """The planner's chosen join order against the order as written.
+
+    CROSS JOIN suppresses SQLite's reordering, so the second form visits
+    t1, t2, t3 in that order while the first is free to choose. Both must
+    return the same multiset.
+    """
+    free = rows_of(db, "SELECT * FROM t1 JOIN t2 JOIN t3 WHERE %s" % pred)
+    forced = rows_of(db,
+                     "SELECT * FROM t1 CROSS JOIN t2 CROSS JOIN t3 WHERE %s"
+                     % pred)
+    if free == forced:
+        return None
+    return ("REORDER", len(free), len(forced))
+
+
+def plans_differ(db, pred):
+    """Whether the two join orders actually produce different plans.
+
+    The vacuity measurement for `reorder_check`, and the only thing that
+    distinguishes it from comparing a query against itself. EXPLAIN QUERY
+    PLAN is SQLite's own account of what it decided to do.
+    """
+    def plan(sql):
+        return tuple(r[3] for r in db.execute("EXPLAIN QUERY PLAN " + sql))
+    return plan("SELECT * FROM t1 JOIN t2 JOIN t3 WHERE %s" % pred) != \
+        plan("SELECT * FROM t1 CROSS JOIN t2 CROSS JOIN t3 WHERE %s" % pred)
+
+
+def cmd_join3(args):
+    """Both three-table relations, with the reordering vacuity reported.
+
+    A separate driver because the interesting measurement here is not how
+    often a predicate is three-valued but how often the planner actually
+    chose a different order -- in the runs where it did not, the reordering
+    relation compared a query against itself and proved nothing.
+    """
+    import random
+    rnd = random.Random(args.seed)
+    db = sqlite3.connect(":memory:")
+    found = tested = skipped = reordered = 0
+
+    for i in range(args.n):
+        specs = build3(db, rnd, args.rows, args.null_rate, index=args.index)
+        pred = gen_join3_predicate(rnd, specs, args.depth)
+        p12 = "%s.%s = %s.%s" % (specs[0][0], specs[0][1][0][0],
+                                 specs[1][0], specs[1][1][0][0])
+        try:
+            moved = plans_differ(db, pred)
+            bad = join3_check(db, pred, p12) or reorder_check(db, pred)
+        except sqlite3.Error:
+            skipped += 1
+            continue
+        tested += 1
+        reordered += moved
+        if bad:
+            found += 1
+            print("FOUND  %s disagreement on seed step %d" % (bad[0], i))
+            for name, cols, rows in specs:
+                print("  CREATE TABLE %s (%s);"
+                      % (name, ", ".join("%s %s" % c for c in cols)))
+                for r in rows:
+                    print("  INSERT INTO %s VALUES (%s);"
+                          % (name, ", ".join(sql_literal(v) for v in r)))
+            print("  predicate: %s" % pred)
+            print("  %s says %r, the other form says %r"
+                  % (bad[0], bad[1], bad[2]))
+            if found >= args.max_reports:
+                break
+
+    print("three-table joins: %d queries, %d disagreements, %d skipped, "
+          "%d where the planner chose a different order (%.0f%%)"
+          % (tested, found, skipped, reordered,
+             100.0 * reordered / tested if tested else 0.0))
+    return 1 if found else 0
+
+
 # --------------------------------------------------------------- HAVING
 #
 # HAVING is the one that does not partition rows at all, which is why it
@@ -1155,6 +1372,16 @@ class Corrupt:
         if k == "join-drop-pair" and "JOIN t2 ON" in sql and "UNION ALL" in sql \
                 and len(rows) > 3:
             return rows[:-1]
+        # One join order returning different rows from another. This is the
+        # defect the reordering relation exists for, and it is the one
+        # planted bug here that is openly a PROXY: SQLite cannot be made to
+        # choose a wrong order on request, so what is corrupted instead is
+        # the CROSS JOIN form -- the one whose order is pinned. The effect
+        # on the relation is the same as a planner that got the free order
+        # wrong, and the limitation is that a real reordering bug would also
+        # change the plan, which this cannot.
+        if k == "reorder-skew" and "CROSS JOIN" in sql and len(rows) > 2:
+            return rows[:-1]
         # An outer join that pads one row too many. The inner-join relation
         # never issues a LEFT JOIN, so it cannot see this at all.
         if k == "leftjoin-overpad" and "LEFT JOIN" in sql and rows \
@@ -1210,44 +1437,58 @@ BUG_KINDS = ["drop-row", "duplicate-row", "null-only", "count-off-by-one",
              "setop-drop-row", "having-drop-group"]
 
 
-JOIN_BUG_KINDS = ["join-drop-pair", "leftjoin-overpad"]
+JOIN_BUG_KINDS = ["join-drop-pair", "leftjoin-overpad", "reorder-skew"]
 
 
 def cmd_joinselftest(args):
-    """The same argument as `selftest`, for the two join relations.
+    """The same argument as `selftest`, for the four join relations.
 
-    Kept separate rather than folded into that table because it would not
-    be an honest comparison: the single-table oracles query `t` and these
-    query `t1` and `t2`, so "TLP does not catch this" would only mean the
-    two were never pointed at the same thing. What is worth measuring is
-    whether the two JOIN relations catch different bugs, and they do.
+    Kept separate from that table rather than folded into it because it
+    would not be an honest comparison: the single-table oracles query `t`
+    and these query `t1`, `t2` and `t3`, so "TLP does not catch this" would
+    only mean the two were never pointed at the same thing.
+
+    All four relations ARE pointed at the same thing, though -- build3
+    creates t1, t2 and t3, and the two-table relations simply ignore the
+    third -- so this table is a real comparison between them.
     """
     import random
     real = sqlite3.connect(":memory:")
-    print("%-20s %10s %12s" % ("planted bug", "INNER", "LEFT JOIN"))
+    print("%-20s %8s %10s %8s %9s"
+          % ("planted bug", "INNER", "LEFT JOIN", "JOIN3", "REORDER"))
     missed = []
     for kind in JOIN_BUG_KINDS:
-        hits = {"inner": 0, "left": 0}
+        hits = dict.fromkeys(("inner", "left", "join3", "reorder"), 0)
         rnd = random.Random(args.seed)
         for _ in range(args.n):
-            t1, t2 = build2(real, rnd, args.rows, args.null_rate)
-            pred = gen_join_predicate(rnd, t1, t2, args.depth)
+            specs = build3(real, rnd, args.rows, args.null_rate)
+            t1, t2, _ = specs
+            pred2 = gen_join_predicate(rnd, t1, t2, args.depth)
+            pred3 = gen_join3_predicate(rnd, specs, args.depth)
+            p12 = "%s.%s = %s.%s" % (t1[0], t1[1][0][0], t2[0], t2[1][0][0])
             bent = Corrupt(real, kind)
-            for name, fn in (("inner", join_check), ("left", leftjoin_check)):
+            probes = (("inner", lambda: join_check(bent, pred2)),
+                      ("left", lambda: leftjoin_check(bent, pred2)),
+                      ("join3", lambda: join3_check(bent, pred3, p12)),
+                      ("reorder", lambda: reorder_check(bent, pred3)))
+            for name, fn in probes:
                 try:
-                    if fn(bent, pred):
+                    if fn():
                         hits[name] += 1
                 except sqlite3.Error:
                     pass
-        print("%-20s %9d%% %11d%%" % (kind,
-                                      100 * hits["inner"] // args.n,
-                                      100 * hits["left"] // args.n))
+        print("%-20s %7d%% %9d%% %7d%% %8d%%"
+              % (kind,
+                 100 * hits["inner"] // args.n,
+                 100 * hits["left"] // args.n,
+                 100 * hits["join3"] // args.n,
+                 100 * hits["reorder"] // args.n))
         if max(hits.values()) == 0:
             missed.append(kind)
     if missed:
         print("\nNOT CAUGHT: %s" % ", ".join(missed))
         return 1
-    print("\nboth planted join bugs are caught, and by different relations")
+    print("\nevery planted join bug is caught, and by different relations")
     return 0
 
 
@@ -1392,6 +1633,17 @@ def main():
     p.add_argument("--no-index", action="store_false", dest="index")
     p.add_argument("--max-reports", type=int, default=3, dest="max_reports")
     p.set_defaults(fn=cmd_join)
+
+    p = sub.add_parser("join3", help="three tables, and join reordering")
+    p.add_argument("--n", type=int, default=400)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--rows", type=int, default=6)
+    p.add_argument("--depth", type=int, default=2)
+    p.add_argument("--null-rate", type=float, default=0.25, dest="null_rate")
+    p.add_argument("--index", action="store_true", default=True)
+    p.add_argument("--no-index", action="store_false", dest="index")
+    p.add_argument("--max-reports", type=int, default=3, dest="max_reports")
+    p.set_defaults(fn=cmd_join3)
 
     p = sub.add_parser("agg", help="aggregate partitioning")
     p.add_argument("--n", type=int, default=400)

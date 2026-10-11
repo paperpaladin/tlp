@@ -231,17 +231,20 @@ entirely.
 
 ```
 $ python3 tlp.py joinselftest
-planted bug               INNER    LEFT JOIN
-join-drop-pair             100%           0%
-leftjoin-overpad             0%         100%
+planted bug             INNER  LEFT JOIN    JOIN3   REORDER
+join-drop-pair           100%         0%      48%        0%
+leftjoin-overpad           0%       100%       0%        0%
+reorder-skew               0%         0%       0%       30%
 
-both planted join bugs are caught, and by different relations
+every planted join bug is caught, and by different relations
 ```
 
 Kept as a separate table from the one above rather than folded into it,
 because that would not be an honest comparison: the single-table oracles
-query `t` and these query `t1` and `t2`, so "TLP does not catch this" would
-only mean the two were never pointed at the same thing.
+query `t` and these query `t1`, `t2` and `t3`, so "TLP does not catch this"
+would only mean the two were never pointed at the same thing. The four join
+relations *are* all pointed at the same three tables, so that table is a
+real comparison between them.
 
 Every generated `ON` predicate is forced to mention both tables. Without
 that it is a filter on one side, the planner pushes it down, and the join
@@ -309,6 +312,91 @@ NULL, then 0 or the empty string, then everything else -- and the suite
 asserts no candidate leads back to the value it replaced. Deleting the
 strictness makes the test run hang rather than fail, which is the honest
 way for that mutation to show up.
+
+## A third table, so the planner finally has a choice
+
+Two tables give a planner one join and two orders to do it in. Three give
+it a real choice, and **reordering is where a planner has the most freedom
+to be wrong** -- which is why, for as long as only two tables existed here,
+this file had to admit that the most interesting thing about joins was
+barely being exercised.
+
+The `ON`-partitioning carries over directly, with the left side of the
+partitioned join now a join itself:
+
+```sql
+  t1 JOIN t2 ON p12 JOIN t3 ON p
+    UNION ALL t1 JOIN t2 ON p12 JOIN t3 ON NOT p
+    UNION ALL t1 JOIN t2 ON p12 JOIN t3 ON p IS NULL
+==  t1 JOIN t2 ON p12 JOIN t3 ON 1
+```
+
+The new relation is the one that could not exist with two tables. SQLite
+documents `CROSS JOIN` as **suppressing its own reordering**: the tables
+are visited in the order written. So the same query written both ways must
+return the same multiset, and the planner's choice is being differenced
+against a fixed order:
+
+```sql
+    SELECT * FROM t1 JOIN t2 JOIN t3 WHERE p
+==  SELECT * FROM t1 CROSS JOIN t2 CROSS JOIN t3 WHERE p
+```
+
+The two forms reach genuinely different machinery. Asked what it decided,
+SQLite answers:
+
+```
+  free  : SCAN t1 | SCAN t3 | BLOOM FILTER ON t2 (b1=?) | SEARCH t2 USING AUTOMATIC COVERING INDEX (b1=?)
+  forced: SCAN t1 | BLOOM FILTER ON t2 (b1=?) | SEARCH t2 USING AUTOMATIC COVERING INDEX (b1=?) | SCAN t3
+```
+
+Different visit order, and an automatic covering index and a Bloom filter
+built at a different point in the plan.
+
+### The relation is worth nothing when the plans agree
+
+In the runs where SQLite picks the same order both ways, this compares a
+query against itself. So the fraction where it actually reordered is
+measured and reported, the same way the three-valued fraction is:
+
+```
+$ python3 tlp.py join3 --n 400
+three-table joins: 400 queries, 0 disagreements, 0 skipped,
+                   247 where the planner chose a different order (62%)
+```
+
+And because the whole relation rests on `CROSS JOIN` pinning the order, the
+suite asks `EXPLAIN QUERY PLAN` whether it really does, rather than taking
+it from the documentation.
+
+### A lever that did not survive being measured properly
+
+This is worth recording because the mistake was mine and it passed a test.
+
+A minimal probe -- three tables, two cross-table comparisons, nothing else
+-- said that equality predicates and an index were what made the planner
+reorder, moving the rate from **15% to 67%**. Both looked decisive, and the
+generator was built around them.
+
+On the shipped generator they are not decisive at all:
+
+| | reordering rate |
+|---|---|
+| as shipped | ~60% |
+| without the equality bias | 1 to 6 points lower |
+| without the index | 6 to 11 points lower |
+| without either | 15 to 19 points lower |
+
+Both still point the same way on every seed tried, and together they are
+worth something. But the 50-point effect the probe reported did not
+transfer, because the real generator's predicates already carry several
+cross-table comparisons and the planner has reasons to reorder with or
+without the help.
+
+The test written to assert the equality lever **passed on noise**: 58%
+against 64% at 200 cases, which is 61% against 60% at 500. What is asserted
+now is the combined effect, whose margin is 15 to 19 points; the individual
+rates are printed without an assertion the sample size cannot support.
 
 ## HAVING partitions groups, so the rule is different a third time
 
@@ -490,8 +578,15 @@ identically above. Every percentage in the first table is a measurement of
 and none of them is a measurement of how much of the optimiser gets
 exercised.
 
-Only two tables are joined, never three, so join *reordering* -- which is
-where a planner has the most freedom to be wrong -- is barely exercised.
+Three tables at most, and the reordering relation only compares the
+planner's order against the written one -- it never asks for a specific
+*different* order, because SQLite has no hint for that beyond `CROSS JOIN`.
+
+`reorder-skew`, the planted bug for it, is openly a **proxy**: SQLite
+cannot be made to choose a wrong order on request, so what gets corrupted
+is the `CROSS JOIN` form, whose order is pinned. The effect on the relation
+matches a planner that got the free order wrong; the limitation is that a
+real reordering bug would also change the plan, which this cannot.
 
 ## The one hand-written thing, and why
 
@@ -519,7 +614,7 @@ equivalent mutant rather than a hole.
 
 ```
 $ make test
-100 passed, 0 failed
+113 passed, 0 failed
 ```
 
 No pytest, no network, no dependencies. `sqlite3` is in the standard
