@@ -1116,5 +1116,113 @@ ok("a lost pair is caught over a three-table join too (%d%%)" % d["join3"]) \
 check("...and the reordering relation never partitions, so it cannot",
       d["reorder"], 0)
 
+# ------------------------------------------------- LIKE against GLOB
+#
+# The one DIFFERENTIAL oracle here rather than a metamorphic one, and it
+# still needs no second database: SQLite ships two independent pattern
+# matchers and they can be pointed at each other.
+#
+# It rests on two preconditions, and both are the kind that would hold
+# quietly for a while and then not. They are checked directly.
+
+# One: LIKE folds ASCII case by default and GLOB never does, so without the
+# pragma every comparison between them disagrees on the first capital
+# letter. connect() pins it -- and the proof that pinning does something is
+# that a connection WITHOUT it answers differently.
+pinned = tlp.connect()
+bare = sqlite3.connect(":memory:")
+check("connect() makes LIKE case-sensitive",
+      pinned.execute("SELECT 'A' LIKE 'a'").fetchone()[0], 0)
+check("...and a connection without the pragma does not, so it is doing work",
+      bare.execute("SELECT 'A' LIKE 'a'").fetchone()[0], 1)
+check("GLOB was always case-sensitive",
+      pinned.execute("SELECT 'A' GLOB 'a'").fetchone()[0], 0)
+
+# Two: the rewrite % -> * and _ -> ? is sound only over PAT_CHARS. A
+# pattern already carrying a GLOB metacharacter means one side reads it as
+# a wildcard and the other as a literal.
+check("the pattern alphabet contains no GLOB metacharacter",
+      [c for c in tlp.PAT_CHARS if c in "*?[]\\"], [])
+refused = 0
+for pat in ("a*b", "a?b", "a[b]c", "a\\_b"):
+    try:
+        tlp.like_to_glob(pat)
+    except AssertionError:
+        refused += 1
+check("like_to_glob refuses an untranslatable pattern", refused, 4)
+
+# And the restriction is load-bearing: translated naively, those same
+# patterns really do make the two matchers disagree.
+disagree = 0
+for v, pat in (("axb", "a*b"), ("axb", "a?b"), ("abc", "a[b]c")):
+    g = pat.replace("%", "*").replace("_", "?")
+    a, b = pinned.execute("SELECT ? LIKE ?, ? GLOB ?", (v, pat, v, g)).fetchone()
+    disagree += (a != b)
+check("...and translating one anyway would change what is matched",
+      disagree, 3)
+
+# With the preconditions met, the two languages agree everywhere -- over
+# every pattern the generator can emit, against values that include NULL,
+# the empty string, and strings containing the other dialect's wildcards.
+vals = [None, "", "a", "A", "aa", "ab", "abc", "a_b", "a%b", "ab*", "x?y", "AB"]
+pats = []
+rnd = random.Random(0)
+for _ in range(60):
+    pats.append(tlp.gen_pattern(rnd))
+pats += ["a", "a%", "%a", "%a%", "a_", "_a", "a_c", "%", "_", "ab%c", "a%b%"]
+mismatch = []
+for v in vals:
+    for pat in pats:
+        a, b = pinned.execute("SELECT ? LIKE ?, ? GLOB ?",
+                              (v, pat, v, tlp.like_to_glob(pat))).fetchone()
+        if a != b:
+            mismatch.append((v, pat, a, b))
+check("LIKE and GLOB agree over %d value/pattern pairs, NULL included"
+      % (len(vals) * len(pats)), mismatch, [])
+
+# Over generated tables, against a correct engine.
+rnd = random.Random(1)
+db = tlp.connect()
+alarms = tested = split = 0
+for _ in range(250):
+    _, cols, rows = tlp.build(db, rnd, 8, 0.25)
+    text = [c for c, t in cols if t == "TEXT"]
+    if not text:
+        continue
+    col = rnd.choice(text)
+    pat = tlp.gen_pattern(rnd)
+    try:
+        bad = tlp.like_glob_check(db, col, pat)
+        hit = db.execute("SELECT COUNT(*) FROM t WHERE %s LIKE '%s'"
+                         % (col, pat)).fetchone()[0]
+    except sqlite3.Error:
+        continue
+    tested += 1
+    alarms += bool(bad)
+    split += (0 < hit < len(rows))
+check("the LIKE/GLOB relation raises no false alarm", alarms, 0)
+pct = split * 100 // tested
+# A pattern matching no row, or every row, makes both matchers agree
+# trivially. That is this relation's vacuity question -- not
+# three-valuedness, which it never asks about.
+ok("patterns split the table %d%% of the time, so the agreement is not "
+   "trivial" % pct) if pct >= 20 else \
+    no("patterns almost never split the table", "%d%%" % pct)
+
+# And pattern matching now reaches every other oracle too, because the
+# shared atom generator emits it -- which is the point of adding it rather
+# than bolting on one more relation.
+rnd = random.Random(7)
+db = tlp.connect()
+_, cols, _ = tlp.build(db, rnd, 8, 0.25)
+withpat = 0
+for _ in range(400):
+    withpat += ("LIKE" in tlp.gen_predicate(rnd, cols, 2)
+                or "GLOB" in tlp.gen_predicate(rnd, cols, 2))
+ok("pattern matching reaches the shared predicate generator (%d of 400)"
+   % withpat) if withpat > 40 else \
+    no("the shared generator almost never emits a pattern match",
+       "%d of 400" % withpat)
+
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)

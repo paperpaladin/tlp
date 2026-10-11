@@ -17,6 +17,7 @@ tlp.py join3   [--n N] [--seed S]    three tables, and join reordering
 tlp.py distinct [--n N] [--seed S]   partition a DISTINCT
 tlp.py group   [--n N] [--seed S]    partition a GROUP BY
 tlp.py having  [--n N] [--seed S]    partition a HAVING clause
+tlp.py like    [--n N] [--seed S]    LIKE against GLOB
 tlp.py selftest                      plant bugs, check the oracles notice
 tlp.py joinselftest                  the same, for the join relations
 tlp.py reduce  [--bug K]             shrink a found case to a minimal one
@@ -427,10 +428,42 @@ foreign keys, no virtual tables, no window functions.
             matches a planner that got the free order wrong; the limitation
             is that a real reordering bug would also change the plan, which
             this cannot. Recorded in the README rather than left implicit.
-- [ ] 12 LIKE and GLOB, with BINARY pinned explicitly
-      why: a rich source of behaviour, and the reason it has been deferred
-           is in the open questions below. Pinning the collation is what
-           keeps it inside the hard invariant rather than outside it.
+- [x] 12 LIKE and GLOB, with the case folding pinned explicitly
+      why: a rich source of behaviour, deferred because it drags in
+           collation, which the hard invariant excludes. Pinning the
+           folding is what keeps it inside the invariant.
+      done: and it turned out to be the one DIFFERENTIAL oracle here
+            rather than a metamorphic one, still with no second database:
+            SQLite ships two independent pattern matchers. Over a
+            restricted alphabet LIKE and GLOB say the same thing under
+            % -> * and _ -> ?, so the two implementations can be pointed
+            at each other.
+            Pattern matching went into the SHARED atom generator rather
+            than only into its own relation, so it now appears inside the
+            predicates every other oracle partitions -- about 1 in 4.
+      proves: glob-skew is caught 27% by this relation and 0% by the six
+            others. 852 value/pattern pairs agree, NULL included.
+      note: two preconditions, both enforced rather than hoped for.
+            LIKE folds ASCII case and GLOB never does, so
+            case_sensitive_like=ON is pinned in a single connect() that
+            every connection goes through -- a connection that forgot it
+            would not fail loudly, it would measure something else. The
+            suite checks that a connection WITHOUT the pragma answers
+            differently, which is the only way to know the pinning does
+            anything.
+            And the rewrite is valid only over an alphabet free of GLOB
+            metacharacters: 'axb' LIKE 'a*b' is FALSE while
+            'axb' GLOB 'a*b' is TRUE, and the same for ? and for [ which
+            opens a character class in one language and is a literal in
+            the other. like_to_glob asserts the alphabet rather than
+            trusting it, and the suite checks both that the assertion
+            fires and that translating such a pattern anyway really would
+            change what is matched.
+      found: the README-consistency check from the previous commit earned
+            its place immediately. Adding patterns to the shared generator
+            moved every measured number in the file, and the suite went red
+            on the composition tables rather than letting the document
+            drift. Every table has been re-measured.
 
 ## Open questions
 
