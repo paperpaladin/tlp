@@ -250,5 +250,81 @@ for _ in range(300):
         pass
 check("300 correct queries raise no false alarms", false_alarms, 0)
 
+# --- the aggregate composition rules are load-bearing ----------------------
+#
+# Each aggregate recombines differently, and the rules look arbitrary until
+# you try the wrong one. The right rule must raise no alarms against a
+# correct database; every wrong rule must raise many. Without the second
+# half, "0 disagreements" would be consistent with a rule that cannot
+# disagree with anything.
+#
+# COUNT is the one worth staring at: its outer combiner is SUM, because
+# counts ADD. Writing COUNT there by analogy with the others is the obvious
+# mistake and it produces an almost totally broken tool.
+
+def agg_alarms(agg, outer, n=250, seed=4):
+    saved = tlp.AGGREGATES[agg]
+    tlp.AGGREGATES[agg] = outer
+    rnd = random.Random(seed)
+    db = sqlite3.connect(":memory:")
+    bad = tested = 0
+    try:
+        for _ in range(n):
+            _, cols, _ = tlp.build(db, rnd, 8, 0.25)
+            ints = [c for c, ty in cols if ty == "INTEGER"]
+            if not ints:
+                continue
+            pred = tlp.gen_predicate(rnd, cols, 2)
+            try:
+                tested += 1
+                if tlp.agg_check(db, pred, agg, ints[0]):
+                    bad += 1
+            except sqlite3.Error:
+                tested -= 1
+    finally:
+        tlp.AGGREGATES[agg] = saved
+    return bad, tested
+
+
+RIGHT = {"SUM": "SUM", "COUNT": "SUM", "MIN": "MIN", "MAX": "MAX"}
+WRONG = {"SUM": ["MIN", "COUNT"], "COUNT": ["COUNT", "MIN"],
+         "MIN": ["SUM", "MAX"], "MAX": ["SUM", "MIN"]}
+
+for agg, right in sorted(RIGHT.items()):
+    bad, tested = agg_alarms(agg, right)
+    check("%s recombines with %s and raises no false alarms (%d checks)"
+          % (agg, right, tested), bad, 0)
+    for w in WRONG[agg]:
+        bad, tested = agg_alarms(agg, w)
+        ok("%s with the wrong combiner %s raises %d of %d" % (agg, w, bad, tested)) \
+            if bad > tested // 3 else \
+            no("%s with the wrong combiner %s raises only %d of %d" % (agg, w, bad, tested),
+               "the rule is not doing any work, so the right one proves nothing")
+
+# And the aggregate oracle sees a bug the other two cannot: an aggregate
+# that is wrong while every row is present and every count agrees.
+t_agg, n_agg = detection("aggregate-skew")
+check("row-level TLP cannot see a skewed aggregate", t_agg, 0)
+check("NoREC cannot see it either", n_agg, 0)
+
+rnd = random.Random(5)
+real = sqlite3.connect(":memory:")
+caught = tried = 0
+for _ in range(200):
+    _, cols, _ = tlp.build(real, rnd, 8, 0.25)
+    ints = [c for c, ty in cols if ty == "INTEGER"]
+    if not ints:
+        continue
+    pred = tlp.gen_predicate(rnd, cols, 2)
+    tried += 1
+    try:
+        if tlp.agg_check(tlp.Corrupt(real, "aggregate-skew"), pred, "SUM", ints[0]):
+            caught += 1
+    except sqlite3.Error:
+        tried -= 1
+pct = 100 * caught // tried if tried else 0
+ok("the aggregate oracle catches it %d%% of the time" % pct) if pct > 50 else \
+    no("the aggregate oracle catches it only %d%% of the time" % pct)
+
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)
