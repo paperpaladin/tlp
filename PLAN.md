@@ -13,6 +13,8 @@ tlp.py tlp     [--n N] [--seed S]    ternary partitioning
 tlp.py norec   [--n N] [--seed S]    optimised against unoptimised
 tlp.py agg     [--n N] [--seed S]    aggregate partitioning
 tlp.py join    [--n N] [--seed S]    partition a join's ON clause
+tlp.py distinct [--n N] [--seed S]   partition a DISTINCT
+tlp.py group   [--n N] [--seed S]    partition a GROUP BY
 tlp.py selftest                      plant bugs, check the oracles notice
 tlp.py joinselftest                  the same, for the join relations
 tlp.py reduce  [--bug K]             shrink a found case to a minimal one
@@ -256,7 +258,60 @@ foreign keys, no virtual tables, no window functions.
             of the time -- what NoREC had actually noticed was the test
             wrapper breaking NoREC. Excluding subqueries gives the honest
             row: 0%, 0%, 85%.
-- [ ] 09 DISTINCT and GROUP BY partitioning
+- [x] 09 DISTINCT and GROUP BY partitioning
+      why: each is the partitioning done over a query shape where the
+           obvious recombination is the wrong one, and the two are wrong in
+           OPPOSITE directions, which is the most instructive version of
+           the trap the aggregate rules set.
+      done: DISTINCT recombines with UNION -- a set union, and the only
+            relation here that is not UNION ALL -- because a value can
+            appear in two partitions: two rows sharing it can land on
+            opposite sides of the predicate.
+            GROUP BY must recombine with UNION ALL inside, for exactly the
+            reason DISTINCT must not: each arm holds part of every group
+            and the three partial counts are the point, so a set union
+            would collapse two arms that counted the same number of rows.
+            The outer step is then COUNT-recombines-with-SUM, group by
+            group.
+      proves: each rule is a false-alarm generator in the other's place,
+            against a correct database, in 200 checks:
+              DISTINCT   UNION 0,  UNION ALL 113, INTERSECT 200, EXCEPT 198
+              GROUP BY   SUM   0,  COUNT 196,     MIN 113,       MAX/AVG 113
+            And each relation catches exactly its own class: a dedup
+            skipped on one path is caught 100% by DISTINCT and 0% by the
+            four others; one group counted wrong is caught 100% by GROUP BY
+            and 0% by the four others. Both leave every row present, every
+            count right and every whole-table aggregate right.
+      note: the 113 is one number appearing four times, and it is one
+            event seen from two sides -- a value landing in more than one
+            partition. UNION ALL then keeps it twice; the per-arm counts
+            then sum above any single arm. Measured (113 of 200 span a
+            partition) rather than left as a coincidence.
+      note: the DISTINCT relation rests on DISTINCT, UNION and GROUP BY all
+            treating two NULLs as the same value while `=` does not. If
+            UNION followed the `=` rule a NULL from two arms would survive
+            twice and the relation would be false for every table holding
+            one. All three operators are checked directly.
+      found: a zero in the selftest table that did not mean what it looked
+            like. DISTINCT reads 0% against drop-row, which reads as "it
+            cannot see a lost row" -- but drop-row is written to fire on
+            "UNION ALL" and this relation recombines with "UNION", so the
+            0% is a property of the trigger string. Added setop-drop-row,
+            the same bug on any set operation: the column moves to 80%, so
+            the relation sees lost rows and it was the bug that could not
+            see the relation. That row of the table exists only to answer
+            that question, and without it the table overclaims.
+      found: and a vacuous test of my own, caught by mutation rather than
+            by a run. Both false-alarm checks passed the composition rule
+            in explicitly -- false_alarms(distinct_check, combine="UNION")
+            -- so they tested a configuration no caller uses and left the
+            shipped default unchecked. Changing the default to UNION ALL
+            kept both green. A parameterised test that always supplies the
+            parameter has stopped testing the thing that ships; they now
+            call with no keyword and assert the defaults separately.
+      found: run_oracle and cmd_agg printed found cases as Python reprs
+            rather than SQL, the same defect the reducer had. Both now use
+            sql_literal.
 
 ## Open questions
 
