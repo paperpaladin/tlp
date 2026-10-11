@@ -14,6 +14,7 @@ reports the conformance of nothing.
     python3 t/test_tlp.py
 """
 import sys
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -434,6 +435,119 @@ i_pad, l_pad = join_detection("leftjoin-overpad")
 ok("an over-padded outer join is caught by the left relation (%d%%)" % l_pad) if l_pad > 50 else \
     no("an over-padded outer join is not caught", "%d%%" % l_pad)
 check("...and the inner relation never issues a LEFT JOIN, so it cannot", i_pad, 0)
+
+# ---------------------------------------------------------------- the reducer
+#
+# A reducer has exactly one property that matters, and it is not how small
+# the output is: whatever comes out MUST STILL FAIL. A reducer that shrinks
+# past the bug produces a minimal case that reproduces nothing and sends
+# whoever reads it hunting for a bug that is not there -- strictly worse
+# than printing the unreduced version.
+#
+# Effectiveness is checkable here in a way it usually is not, because the
+# bug was planted and its trigger condition is therefore known exactly:
+#
+#   drop-row        fires when the partition query returns more than 3 rows,
+#                   and it returns one per table row, so 4 is the true floor
+#   duplicate-row   fires for any non-empty result, so the floor is 1
+#   null-only       fires above 2 rows, so the floor is 3
+#
+# Asserting the exact floor rather than "smaller than before" is what turns
+# this from a smoke test into a measurement. "Smaller" is satisfied by a
+# reducer that drops one row and gives up.
+
+def find_and_reduce(kind, seed=3, rows=10, depth=3):
+    """Search for a case against a planted bug, then shrink it."""
+    rnd = random.Random(seed)
+    db = sqlite3.connect(":memory:")
+    for _ in range(400):
+        _, cols, data = tlp.build(db, rnd, rows, 0.25)
+        tree = tlp.gen_tree(rnd, cols, depth)
+
+        def fails(trial, pred, cols=cols):
+            db.execute("DROP TABLE IF EXISTS t")
+            db.execute("CREATE TABLE t (%s)" % ", ".join("%s %s" % c for c in cols))
+            db.executemany("INSERT INTO t VALUES (%s)" % ",".join("?" * len(cols)),
+                           trial)
+            try:
+                return tlp.tlp_check(tlp.Corrupt(db, kind), pred) is not None
+            except sqlite3.Error:
+                return False
+
+        if not fails(data, tlp.render(tree)):
+            continue
+        before = (len(data), tlp.tree_size(tree))
+        small, stree = tlp.reduce_case(fails, cols, list(data), tree)
+        return before, small, stree, cols, fails
+    return None
+
+
+FLOORS = {"drop-row": 4, "duplicate-row": 1, "null-only": 3}
+for kind, floor in FLOORS.items():
+    got = find_and_reduce(kind)
+    if got is None:
+        no("found a case to reduce for %s" % kind)
+        continue
+    before, small, stree, cols, fails = got
+    # Soundness. The only property that matters.
+    check("%s: the reduced case still fails" % kind,
+          fails(small, tlp.render(stree)), True)
+    # Effectiveness, against the planted bug's known floor.
+    check("%s: shrinks to its true minimum of %d rows" % (kind, floor),
+          len(small), floor)
+    ok("%s: predicate %d nodes -> %d, rows %d -> %d"
+       % (kind, before[1], tlp.tree_size(stree), before[0], len(small)))
+    # The report has to be runnable, which means real SQL and not a repr.
+    probe = sqlite3.connect(":memory:")
+    ddl = "CREATE TABLE t (%s)" % ", ".join("%s %s" % c for c in cols)
+    probe.execute(ddl)
+    for r in small:
+        probe.execute("INSERT INTO t VALUES (%s)"
+                      % ", ".join(tlp.sql_literal(v) for v in r))
+    # Counter, not sorted(): a row is a tuple mixing NULL with integers and
+    # sorted() raises on that comparison. It is also the right relation --
+    # these are multisets, and SQL does not promise an order.
+    check("%s: the printed INSERTs round-trip through sqlite3" % kind,
+          Counter(probe.execute("SELECT * FROM t").fetchall()), Counter(small))
+
+# Reducing something that does not fail is a caller error, not a no-op: it
+# would return a "minimal case" for a bug that was never there.
+try:
+    tlp.reduce_case(lambda rows, pred: False, [("c0", "INTEGER")],
+                    [(1,)], ("atom", "c0 = 1"))
+    no("reduce_case refuses a case that does not fail")
+except ValueError:
+    ok("reduce_case refuses a case that does not fail")
+
+# The shrink order must be WELL-FOUNDED, which is the property whose absence
+# made the first version of this loop run forever: it offered NULL for 0 and
+# 0 for NULL, each counting as progress. So no candidate may lead back to
+# the value it replaced.
+cycles = []
+for ty, vals in (("INTEGER", (None, 0, 3, -1)), ("TEXT", (None, "", "aa"))):
+    for v in vals:
+        for cand in tlp.simpler_than(v, ty):
+            if v in tlp.simpler_than(cand, ty):
+                cycles.append((ty, v, cand))
+check("the value shrink order admits no cycle", cycles, [])
+check("NULL is the bottom of the order", tlp.simpler_than(None, "INTEGER"), ())
+check("0 shrinks only to NULL", tlp.simpler_than(7, "INTEGER"), (None, 0))
+
+# render and gen_tree have to be the same generator the other oracles use,
+# or the reducer is shrinking predicates nothing else would ever produce.
+rnd = random.Random(11)
+db = sqlite3.connect(":memory:")
+_, cols, _ = tlp.build(db, rnd, 6, 0.25)
+sizes = []
+for _ in range(200):
+    tree = tlp.gen_tree(rnd, cols, 2)
+    sizes.append(tlp.tree_size(tree))
+    if tlp.tree_size(tree) != 1 and not tlp.subtrees(tree):
+        no("a compound predicate reports no subtrees", tlp.render(tree))
+        break
+else:
+    ok("every compound predicate offers a subtree to shrink to (max %d nodes)"
+       % max(sizes))
 
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)
