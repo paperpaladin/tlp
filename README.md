@@ -519,7 +519,7 @@ equivalent mutant rather than a hole.
 
 ```
 $ make test
-99 passed, 0 failed
+100 passed, 0 failed
 ```
 
 No pytest, no network, no dependencies. `sqlite3` is in the standard
