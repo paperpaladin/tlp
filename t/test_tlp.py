@@ -1224,5 +1224,84 @@ ok("pattern matching reaches the shared predicate generator (%d of 400)"
     no("the shared generator almost never emits a pattern match",
        "%d of 400" % withpat)
 
+# ------------------------------------------- no relation is redundant
+#
+# The README claims no oracle subsumes another. Until now that was argued
+# one pair at a time, in prose, from the shape of the queries -- "TLP never
+# asks for a count, so it cannot see a count that is wrong". That argument
+# is right but it is not a measurement, and it missed something.
+#
+# The GROUP BY column was DOMINATED by the HAVING column: the same
+# percentage or lower on every one of the ten planted bugs. Nothing in the
+# prose was wrong -- in principle neither subsumes the other, since GROUP
+# partitions a WHERE clause underneath a GROUP BY and re-aggregates the
+# per-arm counts while HAVING partitions the HAVING and re-aggregates
+# nothing. What the table showed was that no planted bug modelled a defect
+# in the path GROUP alone covers, so on the available evidence carrying it
+# was pointless. `groupfilter-skew` is that bug, and GROUP catches it 100%
+# against HAVING's 0%.
+#
+# So the claim is now checked as a whole, pairwise, over the matrix: for
+# every ordered pair of relations there must be some planted bug the first
+# catches and the second does not.
+
+def detection_matrix(n=60, seed=0):
+    """rows = planted bug, columns = relation, values = hit count."""
+    names = ("TLP", "NoREC", "agg", "DISTINCT", "GROUP", "HAVING", "LIKE")
+    matrix = {}
+    for kind in tlp.BUG_KINDS:
+        rnd = random.Random(seed)
+        real = tlp.connect()
+        hits = dict.fromkeys(names, 0)
+        for _ in range(n):
+            _, cols, _ = tlp.build(real, rnd, 8, 0.25)
+            col = cols[0][0]
+            pred = tlp.gen_predicate(rnd, cols, 2)
+            hv = tlp.gen_having(rnd, cols, 2)
+            ints = [c for c, ty in cols if ty == "INTEGER"]
+            text = [c for c, ty in cols if ty == "TEXT"]
+            bent = tlp.Corrupt(real, kind)
+            probes = [("TLP", lambda: tlp.tlp_check(bent, pred)),
+                      ("NoREC", lambda: tlp.norec_check(bent, pred)),
+                      ("DISTINCT", lambda: tlp.distinct_check(bent, pred, col)),
+                      ("GROUP", lambda: tlp.group_check(bent, pred, col)),
+                      ("HAVING", lambda: tlp.having_check(bent, hv, col))]
+            if ints:
+                probes.append(("agg",
+                               lambda: tlp.agg_check(bent, pred, "SUM", ints[0])))
+            if text:
+                probes.append(("LIKE",
+                               lambda: tlp.like_glob_check(
+                                   bent, rnd.choice(text), tlp.gen_pattern(rnd))))
+            for name, fn in probes:
+                try:
+                    hits[name] += bool(fn())
+                except sqlite3.Error:
+                    pass
+        matrix[kind] = hits
+    return names, matrix
+
+
+names, matrix = detection_matrix()
+dominated = []
+for a in names:
+    for b in names:
+        if a == b:
+            continue
+        # a is dominated by b when b catches at least as much of every bug
+        if all(matrix[k][a] <= matrix[k][b] for k in matrix):
+            dominated.append("%s is dominated by %s" % (a, b))
+check("no relation's detection is dominated by another's", dominated, [])
+
+# Every relation must also catch something, or it is in the table for
+# nothing at all.
+useless = [a for a in names if not any(matrix[k][a] for k in matrix)]
+check("every relation catches at least one planted bug", useless, [])
+
+# And every planted bug must be caught, which is the property `selftest`
+# exits non-zero on.
+uncaught = [k for k in matrix if not any(matrix[k].values())]
+check("every planted bug is caught by at least one relation", uncaught, [])
+
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)

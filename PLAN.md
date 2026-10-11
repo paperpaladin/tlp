@@ -495,6 +495,31 @@ foreign keys, no virtual tables, no window functions.
            here assumes a fixed schema for the life of a case, so this item
            is really about whether that assumption has to hold.
 
+## Found after the sequence above
+
+Not a planned item -- it came out of reading the selftest table rather than
+the plan, and it is recorded here because it changed what the table means.
+
+**The GROUP BY column was dominated by the HAVING column**, the same
+percentage or lower on all ten planted bugs. The prose argument for
+carrying both was and is correct: GROUP BY partitions a WHERE clause
+underneath a grouping and re-aggregates the per-arm counts, HAVING
+partitions the HAVING and re-aggregates nothing, and neither subsumes the
+other. But the TABLE said otherwise, because nothing modelled a defect in
+the path GROUP BY alone covers. On the available evidence the relation was
+redundant.
+
+`groupfilter-skew` is that defect -- a per-partition grouped count that is
+wrong, which is grouping gone wrong under a filter. GROUP BY catches it
+100%, HAVING 0%.
+
+And the claim is now checked as a matrix instead of argued pair by pair:
+for every ordered pair of relations there must be some planted bug the
+first catches and the second does not. Deleting groupfilter-skew turns that
+check red with "GROUP is dominated by HAVING", which is how the hole was
+found in the first place. A design claim that is only ever argued in prose
+is a design claim nobody has tested.
+
 ## Open questions
 
 - RESOLVED by item 12. Yes, with the case folding pinned rather than the
