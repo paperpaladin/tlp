@@ -725,5 +725,165 @@ ok("...because of the trigger, not the relation: widened, it is caught (%d%%)"
     no("the DISTINCT relation cannot see a lost row even when widened",
        repr(wide))
 
+# ------------------------------------------------------------- HAVING
+#
+# HAVING partitions GROUPS, not rows, and the groups are formed by the
+# GROUP BY before HAVING ever runs. So each group arrives whole in exactly
+# one arm, already counted, and the recombination is a plain UNION ALL with
+# no re-aggregation -- the simplest rule here, in the exact place where
+# item 09 needed the most care.
+#
+# Which moves what is load-bearing. For DISTINCT and GROUP BY the
+# composition OPERATOR was the trap. Here it is not a trap at all, and the
+# traps are all in the arms. Both halves of that are measured below.
+
+def having_alarms(n=200, seed=0, **kw):
+    """False alarms from the HAVING relation against a correct engine."""
+    rnd = random.Random(seed)
+    db = sqlite3.connect(":memory:")
+    a = t = 0
+    for _ in range(n):
+        _, cols, _ = tlp.build(db, rnd, 8, 0.40)
+        pred = tlp.gen_having(rnd, cols, 2)
+        try:
+            bad = tlp.having_check(db, pred, cols[0][0], **kw)
+        except sqlite3.Error:
+            continue
+        t += 1
+        a += bool(bad)
+    return a, t
+
+# As shipped, with no keyword, so the defaults are what is under test.
+check("the HAVING relation as shipped raises no false alarm",
+      having_alarms()[0], 0)
+# Spelled out literally rather than as tlp.HAVING_ARMS, because the
+# constant IS the thing under test: comparing it to itself passes for any
+# value it is given. Changing the shipped arms to a two-way split left this
+# green when it was written the other way.
+check("...and its default arms and combiner are the correct ones",
+      tlp.having_check.__defaults__,
+      ("UNION ALL", ("(%s)", "NOT (%s)", "(%s) IS NULL")))
+
+# The arms are load-bearing: they must cover every group exactly once.
+A = tlp.HAVING_ARMS
+for label, kw, floor in (
+        ("dropping the IS NULL arm", {"arms": A[:2]}, 0.3),
+        ("IS NOT TRUE alongside an IS NULL arm",
+         {"arms": ("(%s)", "(%s) IS NOT TRUE", "(%s) IS NULL")}, 0.3),
+        ("a duplicated TRUE arm",
+         {"arms": ("(%s)", "(%s)", "NOT (%s)", "(%s) IS NULL")}, 0.6)):
+    a, t = having_alarms(**kw)
+    if a >= floor * t:
+        ok("HAVING: %s raises %d false alarms in %d" % (label, a, t))
+    else:
+        no("HAVING: %s is not load-bearing" % label, "%d in %d" % (a, t))
+
+# And the combiner is NOT load-bearing, which is the opposite of every
+# other relation here and is recorded rather than quietly relied on. Each
+# arm emits at most one row per group key and the key is unique within a
+# group, so no two rows of the recombined query are ever identical and the
+# set union has nothing to collapse.
+check("HAVING: UNION for UNION ALL is an EQUIVALENT rewrite, not a bug",
+      having_alarms(combine="UNION")[0], 0)
+
+# A two-arm split is also sound: `p IS NOT TRUE` is exactly FALSE-or-NULL,
+# so p and p IS NOT TRUE already cover every group once. The three-way
+# split is therefore a choice, not a correctness requirement -- and the
+# same holds for the row-level relation this whole project is named after.
+check("HAVING: a two-arm IS NOT TRUE split is sound too",
+      having_alarms(arms=("(%s)", "(%s) IS NOT TRUE"))[0], 0)
+
+rnd = random.Random(0)
+db = sqlite3.connect(":memory:")
+two = three = tested = 0
+for _ in range(200):
+    _, cols, _ = tlp.build(db, rnd, 8, 0.25)
+    pred = tlp.gen_predicate(rnd, cols, 2)
+    try:
+        whole = tlp.rows_of(db, "SELECT * FROM t")
+        p3 = tlp.rows_of(db, "SELECT * FROM t WHERE (%s) "
+                             "UNION ALL SELECT * FROM t WHERE NOT (%s) "
+                             "UNION ALL SELECT * FROM t WHERE (%s) IS NULL"
+                             % (pred, pred, pred))
+        p2 = tlp.rows_of(db, "SELECT * FROM t WHERE (%s) "
+                             "UNION ALL SELECT * FROM t WHERE (%s) IS NOT TRUE"
+                             % (pred, pred))
+    except sqlite3.Error:
+        continue
+    tested += 1
+    three += (whole != p3)
+    two += (whole != p2)
+check("row-level TLP: the three-arm split holds", three, 0)
+check("row-level TLP: a two-arm IS NOT TRUE split holds just as well", two, 0)
+
+# The generator has to produce legal HAVING SQL, and a HAVING partition has
+# to actually split the groups. The floor is much lower than the row-level
+# 32% for a structural reason, measured here rather than excused: there are
+# only about four groups in an eight-row table, and splitting four things
+# three ways while leaving no arm empty is simply harder than splitting
+# eight.
+rnd = random.Random(0)
+db = sqlite3.connect(":memory:")
+split = tested = errors = 0
+groups = []
+for _ in range(400):
+    _, cols, _ = tlp.build(db, rnd, 8, 0.40)
+    col = cols[0][0]
+    pred = tlp.gen_having(rnd, cols, 2)
+    try:
+        t, f, u = tlp.having_group_sizes(db, pred, col)
+        groups.append(db.execute(
+            "SELECT COUNT(*) FROM (SELECT %s FROM t GROUP BY %s)"
+            % (col, col)).fetchone()[0])
+    except sqlite3.Error:
+        errors += 1
+        continue
+    tested += 1
+    split += bool(t and f and u)
+check("every generated HAVING predicate is legal SQL", errors, 0)
+pct = split * 100 // tested
+ok("HAVING predicates split the groups three ways %d%% of the time "
+   "(%.1f groups per table)" % (pct, sum(groups) / len(groups))) if pct >= 12 \
+    else no("HAVING predicates almost never split the groups", "%d%%" % pct)
+
+
+def having_detection(kind, n=120, seed=0):
+    rnd = random.Random(seed)
+    real = sqlite3.connect(":memory:")
+    hits = dict.fromkeys(("TLP", "NoREC", "agg", "DISTINCT", "GROUP",
+                          "HAVING"), 0)
+    for _ in range(n):
+        _, cols, _ = tlp.build(real, rnd, 8, 0.40)
+        col = cols[0][0]
+        bent = tlp.Corrupt(real, kind)
+        pred = tlp.gen_predicate(rnd, cols, 2)
+        hv = tlp.gen_having(rnd, cols, 2)
+        ints = [c for c, ty in cols if ty == "INTEGER"]
+        probes = [("TLP", lambda: tlp.tlp_check(bent, pred)),
+                  ("NoREC", lambda: tlp.norec_check(bent, pred)),
+                  ("DISTINCT", lambda: tlp.distinct_check(bent, pred, col)),
+                  ("GROUP", lambda: tlp.group_check(bent, pred, col)),
+                  ("HAVING", lambda: tlp.having_check(bent, hv, col))]
+        if ints:
+            probes.append(("agg", lambda: tlp.agg_check(bent, pred, "SUM", ints[0])))
+        for name, fn in probes:
+            try:
+                hits[name] += bool(fn())
+            except sqlite3.Error:
+                pass
+    return {k: v * 100 // n for k, v in hits.items()}
+
+
+# A group wrongly excluded by a HAVING filter. Nothing else here writes a
+# HAVING clause, so nothing else can see it -- the sixth relation earns its
+# place the same way the other five did.
+h = having_detection("having-drop-group")
+ok("a group lost to a HAVING filter is caught by the HAVING relation (%d%%)"
+   % h["HAVING"]) if h["HAVING"] > 50 else \
+    no("a group lost to a HAVING filter is not caught", repr(h))
+check("...and nothing else writes HAVING, so nothing else can see it",
+      [h[k] for k in ("TLP", "NoREC", "agg", "DISTINCT", "GROUP")],
+      [0, 0, 0, 0, 0])
+
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)

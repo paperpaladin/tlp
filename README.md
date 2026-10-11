@@ -9,15 +9,16 @@ $ python3 tlp.py tlp --n 500
 TLP: 500 queries, 0 disagreements, 0 skipped, 152 genuinely three-valued (30%)
 
 $ python3 tlp.py selftest
-planted bug               TLP    NoREC      agg  DISTINCT    GROUP
-drop-row                 100%       0%       0%        0%      80%
-duplicate-row            100%       0%       0%        0%     100%
-null-only                 21%       0%       0%        0%      21%
-count-off-by-one           0%     100%       0%        0%       0%
-aggregate-skew             0%       0%      86%        0%       0%
-distinct-dup               0%       0%       0%      100%       0%
-group-skew                 0%       0%       0%        0%     100%
-setop-drop-row           100%       0%       0%       80%      80%
+planted bug           TLP  NoREC    agg  DISTINCT  GROUP  HAVING
+drop-row             100%     0%     0%        0%    73%     73%
+duplicate-row        100%     0%     0%        0%   100%    100%
+null-only             21%     0%     0%        0%    19%     31%
+count-off-by-one       0%   100%     0%        0%     0%      0%
+aggregate-skew         0%     0%    88%        0%     0%      0%
+distinct-dup           0%     0%     0%      100%     0%      0%
+group-skew             0%     0%     0%        0%   100%    100%
+setop-drop-row       100%     0%     0%       73%    73%     73%
+having-drop-group      0%     0%     0%        0%     0%     98%
 
 every planted bug is caught by at least one oracle
 ```
@@ -95,6 +96,8 @@ was built for and **nothing else**:
 - None of the four groups, so one group counted wrong -- with every row
   present, every count right and every whole-table aggregate right -- is
   invisible to all of them.
+- None of the five writes a `HAVING` clause, so a group wrongly filtered
+  out by one is invisible to all of them.
 
 ### One zero in that table is not what it looks like
 
@@ -307,6 +310,112 @@ asserts no candidate leads back to the value it replaced. Deleting the
 strictness makes the test run hang rather than fail, which is the honest
 way for that mutation to show up.
 
+## HAVING partitions groups, so the rule is different a third time
+
+A `WHERE` predicate decides which **rows** survive. An `ON` predicate
+decides which **pairs** exist. A `HAVING` predicate decides which
+**groups** survive -- and the groups are formed by the `GROUP BY` before
+`HAVING` ever runs. So every group makes the predicate exactly one of TRUE,
+FALSE or NULL, and partitioning it splits the groups three ways while
+leaving every group itself untouched.
+
+That makes the recombination the **simplest** one here, in the exact place
+where `GROUP BY` needed the most care:
+
+```sql
+  SELECT g, COUNT(*) FROM t GROUP BY g HAVING h
+    UNION ALL SELECT g, COUNT(*) FROM t GROUP BY g HAVING NOT h
+    UNION ALL SELECT g, COUNT(*) FROM t GROUP BY g HAVING h IS NULL
+==  SELECT g, COUNT(*) FROM t GROUP BY g
+```
+
+Plain `UNION ALL`, no re-aggregation. The `GROUP BY` relation needed
+`SUM(n)` over its arms because partitioning a `WHERE` clause cuts every
+group into three pieces that have to be added back. Partitioning a `HAVING`
+clause cuts no group at all: each one arrives whole in exactly one arm,
+already counted.
+
+### So what is load-bearing moves
+
+For `DISTINCT` and `GROUP BY` the composition operator was the trap. Here
+it is not a trap at all, and the traps are all in the arms:
+
+| variation | false alarms in 200 |
+|---|---|
+| as shipped | **0** |
+| `UNION` instead of `UNION ALL` | **0** -- an equivalent rewrite |
+| drop the `IS NULL` arm | 88 |
+| `IS NOT TRUE` alongside an `IS NULL` arm | 88 |
+| a duplicated TRUE arm | 136 |
+
+`UNION` costs nothing here because each arm emits at most one row per group
+key and the key is unique within a group, so the recombined query never
+contains two identical rows and a set union has nothing to collapse. That
+is recorded rather than relied on quietly -- it is the one place in this
+project where the obvious-looking mistake is not a mistake.
+
+### The three-way split is a choice, not a correctness requirement
+
+The fourth row of that table is the one that changed what I thought this
+project was doing. `h IS NOT TRUE` is exactly FALSE-or-NULL, so **two**
+arms already cover every group once:
+
+| | false alarms in 200 |
+|---|---|
+| `h` / `NOT h` / `h IS NULL` | 0 |
+| `h` / `h IS NOT TRUE` | 0 |
+
+Both are sound. And it is not a quirk of `HAVING` -- the same two-arm split
+holds for the row-level relation this project is named after, checked
+directly over 200 queries. "Ternary" describes how the technique is usually
+written, not a property it needs in order to be valid.
+
+The obvious next claim is that three arms is nonetheless the **stronger**
+test, because it issues a third query shape the engine may plan
+differently. That claim is not supported by anything measured here:
+
+| planted bug | three arms | two arms |
+|---|---|---|
+| `drop-row` | 100% | 100% |
+| `duplicate-row` | 100% | 100% |
+| `null-only` | 21% | 21% |
+| `setop-drop-row` | 100% | 100% |
+
+Identical. Which is a finding about the **planted bugs** rather than about
+the relations: these wrappers corrupt result sets, not query plans, so they
+cannot tell two sound relations apart no matter how differently a real
+engine would execute them. That is the ceiling of this whole selftest
+approach and it is worth stating plainly, because the planted-bug table is
+the first thing in this file and it would otherwise read as measuring more
+than it does.
+
+### The generator is where the difficulty went instead
+
+A HAVING predicate is built from aggregates, and aggregates go NULL in a
+way columns do not: `SUM`, `MIN` and `MAX` of a group whose values are all
+NULL are NULL, while `COUNT(*)` and `COUNT(c)` never are. So the mix of
+aggregates decides whether the third arm exists at all:
+
+| `COUNT` terms | NULL rate | three-valued | has a NULL arm | partitions nothing |
+|---|---|---|---|---|
+| 0.10 | 0.25 | 15% | 32% | 43% |
+| **0.10** | **0.40** | **18%** | **42%** | **33%** |
+| 0.10 | 0.55 | 15% | 48% | 32% |
+| 0.25 | 0.40 | 14% | 35% | 38% |
+| all `COUNT` | any | 0% | 0% | -- |
+
+Same interior optimum as the row-level NULL rate, and for the same reason:
+more NULLs fill the third arm but empty the other two. `having` is the one
+command whose NULL-rate default is 0.40 rather than 0.25, because a group
+goes NULL only when **every** value in it is NULL, which takes more NULLs
+than making one row's predicate go NULL.
+
+18% is far below the row-level 32%, and the reason is structural rather
+than fixable: an eight-row table has about **3.9 groups**, and splitting
+four things three ways without leaving an arm empty is simply harder than
+splitting eight. The right comparison for this number is not the row-level
+one.
+
 ## The generator decides whether any of this means anything
 
 TLP splits rows three ways. A predicate that is never NULL leaves the third
@@ -371,8 +480,15 @@ no surviving part of the predicate mentions it, which is visible in the
 worked example above.
 
 `GROUP BY` is partitioned only for `COUNT(*)`, and only on a single
-grouping column. `HAVING` is never generated, which is a real gap: it is
-where the grouped equivalent of a pushed-down predicate goes wrong.
+grouping column.
+
+**The planted bugs cannot distinguish two sound relations.** They wrap the
+connection and corrupt result sets, so they model a wrong answer but never
+a wrong plan -- which is why the two-arm and three-arm splits score
+identically above. Every percentage in the first table is a measurement of
+"would this relation notice a result that is wrong in this specific way",
+and none of them is a measurement of how much of the optimiser gets
+exercised.
 
 Only two tables are joined, never three, so join *reordering* -- which is
 where a planner has the most freedom to be wrong -- is barely exercised.
@@ -403,7 +519,7 @@ equivalent mutant rather than a hole.
 
 ```
 $ make test
-86 passed, 0 failed
+99 passed, 0 failed
 ```
 
 No pytest, no network, no dependencies. `sqlite3` is in the standard
