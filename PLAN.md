@@ -465,11 +465,48 @@ foreign keys, no virtual tables, no window functions.
             on the composition tables rather than letting the document
             drift. Every table has been re-measured.
 
+- [ ] 13 a view, and a CTE, expressing the same query
+      why: every relation here compares two queries over base tables. A
+           view is the same query wearing a name, and SQLite either flattens
+           it into the outer query or materialises it -- two different plans
+           for text that must mean the same thing. It is the cheapest way
+           to get a second plan for one relation without a second engine,
+           and it is the shape the reordering relation had to fake with
+           CROSS JOIN.
+- [ ] 14 HAVING over SUM, MIN and MAX, and a second grouping column
+      why: item 10 partitions HAVING only for COUNT(*) on one grouping
+           column, which is the easiest case: COUNT(*) is never NULL and
+           one column groups NULLs into exactly one group. Two columns
+           make the grouping key a tuple with its own NULL rule, and the
+           other aggregates reach the composition table again.
+- [ ] 15 LIKE with ESCAPE, and GLOB character classes
+      why: item 12 bought LIKE at the price of a five-character pattern
+           alphabet, because the LIKE-to-GLOB rewrite breaks on any GLOB
+           metacharacter. ESCAPE and [...] are exactly the parts that were
+           excluded, and they need an oracle that is not the other matcher
+           -- most likely Python's fnmatch and a hand-written escape
+           walker, which is a different kind of oracle from anything here.
+- [ ] 16 the reducer shrinks the schema too
+      why: an unused column survives into the reduced CREATE TABLE even
+           when nothing in the surviving predicate mentions it, which the
+           README shows in its own worked example. Recorded as an open
+           question by item 06; the reason it was left out is that dropping
+           a column changes the DDL rather than the data and every oracle
+           here assumes a fixed schema for the life of a case, so this item
+           is really about whether that assumption has to hold.
+
 ## Open questions
 
-- Whether to generate `LIKE` and `GLOB`. They are a rich source of
-  behaviour but drag in collation, which the hard invariant excludes.
-  Probably yes with `BINARY` pinned explicitly.
+- RESOLVED by item 12. Yes, with the case folding pinned rather than the
+  collation: `case_sensitive_like=ON` in a single `connect()`. The pragma
+  bought more than access to `LIKE` -- it made `GLOB` usable as `LIKE`'s
+  reference implementation, which is the only differential oracle in this
+  project.
+- Whether the planted bugs can be made to model a wrong PLAN rather than a
+  wrong RESULT. They wrap the connection and corrupt result sets, which is
+  why the two-arm and three-arm splits score identically and why
+  `reorder-skew` has to corrupt the pinned-order query as a proxy. No idea
+  yet what the honest version looks like without patching SQLite.
 - RESOLVED by item 06. Reduction does both, and the data axis matters
   more: rows go 10 -> 1 while predicates go 13 nodes -> 1. The two
   interact in the direction that helps, since a smaller predicate makes
