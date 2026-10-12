@@ -28,9 +28,11 @@ which it will. Measuring that is what `tlp vacuity` is for.
 Eleven relations, and none of them is redundant: for every pair there is a
 planted bug one catches and the other does not. That is measured rather
 than asserted -- `selftest` and `joinselftest` plant the bugs and print
-which relations noticed -- and the measurement has already earned its keep
-by showing that one relation WAS redundant until a bug was written for the
-path only it covers.
+which relations noticed -- and the measurement has earned its keep twice,
+by showing that TWO relations were redundant until a bug was written for
+the path only each of them covers. The second time, the claim in this
+docstring was the thing that turned out to be false: it said eleven and the
+check covered seven.
 
     tlp.py truth           three-valued logic, exhaustively (a calibration)
     tlp.py vacuity         how often the generator is interesting at all
@@ -1546,6 +1548,25 @@ class Corrupt:
         # change the plan, which this cannot.
         if k == "reorder-skew" and "CROSS JOIN" in sql and len(rows) > 2:
             return rows[:-1]
+        # A pair lost from a THREE-table ON-partition, and nowhere else.
+        #
+        # This bug exists because the join table said join3 was redundant:
+        # its column was dominated by the inner relation's on every planted
+        # join bug -- 100/0/0 against 48/0/0 -- so on the available evidence
+        # carrying both was pointless. That is the same hole the single-table
+        # table had for GROUP against HAVING, left open one table lower
+        # while the module docstring claimed "none of them is redundant".
+        #
+        # In principle neither subsumes the other: the inner relation
+        # partitions the ON clause of a two-table join, join3 partitions the
+        # ON clause of a join whose LEFT SIDE IS ITSELF A JOIN, which is the
+        # shape where the planner has an order to choose. The condition
+        # names that shape -- a UNION ALL partition query that mentions t3 --
+        # and no other relation here emits one: the inner and left relations
+        # never join t3, and the reordering relation never partitions.
+        if k == "join3-drop-pair" and "JOIN t3" in sql and "UNION ALL" in sql \
+                and len(rows) > 3:
+            return rows[:-1]
         # An outer join that pads one row too many. The inner-join relation
         # never issues a LEFT JOIN, so it cannot see this at all.
         if k == "leftjoin-overpad" and "LEFT JOIN" in sql and rows \
@@ -1631,7 +1652,8 @@ BUG_KINDS = ["drop-row", "duplicate-row", "null-only", "count-off-by-one",
              "groupfilter-skew"]
 
 
-JOIN_BUG_KINDS = ["join-drop-pair", "leftjoin-overpad", "reorder-skew"]
+JOIN_BUG_KINDS = ["join-drop-pair", "leftjoin-overpad", "reorder-skew",
+                  "join3-drop-pair"]
 
 
 def cmd_joinselftest(args):
