@@ -607,7 +607,7 @@ and gives up. Hitting the floor is a measurement.
 ### The shrink order has to be well-founded
 
 The value axis looks like the easy one and is the only part that went
-wrong. The first version offered every value NULL and 0 as candidates,
+wrong. Its first version offered every value NULL and 0 as candidates,
 counted any accepted swap as progress, and **never terminated**: NULL
 became 0, then 0 became NULL, forever, each step looking locally like an
 improvement.
@@ -704,8 +704,7 @@ planner's order against the written one, it never asks for a specific
 `reorder-skew`, the planted bug for it, is openly a proxy: SQLite
 cannot be made to choose a wrong order on request, so what gets corrupted
 is the `CROSS JOIN` form, whose order is pinned. The effect on the relation
-matches a planner that got the free order wrong. The limitation is that a
-real reordering bug would also change the plan, and this cannot.
+matches a planner that got the free order wrong. One limitation is that a real reordering bug would also change the plan, and this cannot.
 
 ## The one hand-written thing, and why
 
