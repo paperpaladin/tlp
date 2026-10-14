@@ -75,7 +75,7 @@ Ranked by how little of it we control.
 
 2. The SQL standard's three-valued truth tables, transcribed in
    `tlp.py` and checked exhaustively against SQLite. This is a
-   CALIBRATION, not the oracle, and the distinction matters: the tables are
+   CALIBRATION, not the oracle, and the distinction matters. The tables are
    written down by hand here, exactly the thing this project
    otherwise avoids. They exist to prove the model of three-valued logic
    the generator is built on matches the engine, before anything is built
