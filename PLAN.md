@@ -145,7 +145,7 @@ foreign keys, no virtual tables, no window functions.
             `"IS NULL" in sql`, but the partition query ends in
             `(p) IS NULL` whatever p is, so it fired every time and was
             caught 100% of the time, exactly like the broad ones. Counting
-            occurrences instead takes it to 23%, which is the honest shape
+            occurrences instead takes it to 23%, the honest shape
             for a narrow bug met by a random generator.
       note: the NULL rate has an optimum, which was not obvious until it
             was measured. At 0 nothing is three-valued; at 0.6 the rows
@@ -156,7 +156,7 @@ foreign keys, no virtual tables, no window functions.
 - [x] 06 `tlp reduce`, shrink a failing case to a minimal schema,
       dataset and predicate
       why: an unreduced report is a thousand rows and a predicate nobody
-           will read, which is the same as no report.
+           will read, and that is the same as no report.
       done: greedy delta debugging over three axes, drop a row, replace a
             predicate node with one of its own subtrees, pull a value
             toward NULL. Needed the generator refactored to hand back a
@@ -164,7 +164,7 @@ foreign keys, no virtual tables, no window functions.
             `render(gen_tree(...))` so every existing oracle is unchanged,
             which was checked by the suite staying green at the same
             numbers across the refactor.
-      proves: SOUNDNESS, which is the only property that matters, what
+      proves: SOUNDNESS, the only property that matters, what
             comes out must still fail. A reducer that shrinks past the bug
             emits a minimal case reproducing nothing and sends its reader
             hunting for a bug that is not there, which is worse than
@@ -202,7 +202,7 @@ foreign keys, no virtual tables, no window functions.
             relation, since these are multisets.
       survived: breaking soundness, dropping a row without re-checking,
             is caught for drop-row and null-only but NOT for
-            duplicate-row, which is an equivalent mutant: that bug fires on
+            duplicate-row, an equivalent mutant: that bug fires on
             any non-empty result, so dropping rows unconditionally lands on
             its real floor of 1 and the case still fails. Recorded rather
             than chased.
@@ -220,7 +220,7 @@ foreign keys, no virtual tables, no window functions.
             own unmatched rows and the padding is counted three times. The
             decomposition does: a left join is its inner join plus one row
             per left row with no TRUE match. That brings NOT EXISTS into
-            the picture, which is a correlated subquery the optimiser
+            the picture, a correlated subquery the optimiser
             rewrites into something else entirely.
             Every generated ON predicate is forced to mention both tables.
             Without it the predicate is a filter the planner pushes down
@@ -246,12 +246,12 @@ foreign keys, no virtual tables, no window functions.
             COUNT with SUM, because counts add instead of counting. AVG
             is left out, not approximated: the average of three
             averages is not the average, and weighting them needs the
-            counts, which is a different query.
+            counts, and that is a different query.
       proves: the rules are load-bearing, which matters because they look
             arbitrary. Against a correct database each right rule raises
             0 alarms in 210 checks and each wrong one raises 125 to 210.
             COUNT is the one to stare at: writing COUNT as its own
-            combiner, which is the obvious mistake, reports a bug in 208
+            combiner, the obvious mistake, reports a bug in 208
             of 210 correct queries.
             And it catches what the other two cannot: an aggregate wrong
             while every row is present and every count agrees is caught
@@ -265,7 +265,7 @@ foreign keys, no virtual tables, no window functions.
 - [x] 09 DISTINCT and GROUP BY partitioning
       why: each is the partitioning done over a query shape where the
            obvious recombination is the wrong one, and the two are wrong in
-           OPPOSITE directions, which is the most instructive version of
+           OPPOSITE directions, the most instructive version of
            the trap the aggregate rules set.
       done: DISTINCT recombines with UNION: a set union, and the only
             relation here that is not UNION ALL, because a value can
@@ -450,7 +450,7 @@ foreign keys, no virtual tables, no window functions.
             every connection goes through: a connection that forgot it
             would not fail loudly, it would measure something else. The
             suite checks that a connection WITHOUT the pragma answers
-            differently, which is the only way to know the pinning does
+            differently, and nothing else establishes that the pinning does
             anything.
             And the rewrite is valid only over an alphabet free of GLOB
             metacharacters: 'axb' LIKE 'a*b' is FALSE while
@@ -476,7 +476,7 @@ foreign keys, no virtual tables, no window functions.
            CROSS JOIN.
 - [ ] 14 HAVING over SUM, MIN and MAX, and a second grouping column
       why: item 10 partitions HAVING only for COUNT(*) on one grouping
-           column, which is the easiest case: COUNT(*) is never NULL and
+           column, the easiest case: COUNT(*) is never NULL and
            one column groups NULLs into exactly one group. Two columns
            make the grouping key a tuple with its own NULL rule, and the
            other aggregates reach the composition table again.
@@ -486,7 +486,7 @@ foreign keys, no virtual tables, no window functions.
            metacharacter. ESCAPE and [...] are exactly the parts that were
            excluded, and they need an oracle that is not the other matcher,
            most likely Python's fnmatch and a hand-written escape
-           walker, which is a different kind of oracle from anything here.
+           walker, a different kind of oracle from anything here.
 - [ ] 16 the reducer shrinks the schema too
       why: an unused column survives into the reduced CREATE TABLE even
            when nothing in the surviving predicate mentions it, which the

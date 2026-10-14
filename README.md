@@ -208,7 +208,7 @@ reason `DISTINCT` must not. A group's rows are split across the three
 partitions, so each arm holds part of every group, and the three partial
 counts are the entire point: a set union would collapse two arms that
 happened to count the same number of rows. Then the counts are
-re-aggregated per group, which is the `COUNT`-recombines-with-`SUM` rule
+re-aggregated per group, the `COUNT`-recombines-with-`SUM` rule
 from the aggregate table applied group by group:
 
 ```sql
