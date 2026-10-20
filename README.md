@@ -105,10 +105,11 @@ was built for and **nothing else**:
   out by one is invisible to all of them.
 - None of the six reads a view or a CTE, so a query that answers one way
   flat and another way through a name is invisible to all of them.
-- None of the seven can write a negated character class, because `LIKE` has
-  none and a translation cannot invent one, so a class matcher that is
-  wrong only when the class is negated is invisible to all of them. That
-  one is answered by Python's `fnmatch` rather than by SQLite.
+- None of those seven can write a negated character class, and neither can
+  the `LIKE` relation, since `LIKE` has no classes at all and a
+  translation cannot invent one. So a class matcher wrong only when the
+  class is negated is invisible to all eight, and the one that answers it
+  is Python's `fnmatch` rather than SQLite.
 
 ### And the matrix itself was missing four relations
 
@@ -998,9 +999,11 @@ nothing is the expected outcome. What this has to prove is that it *would*
 report something. `selftest` exists for that, and it is why the planted-bug
 table opens this file.
 
-No other engines. There is no DuckDB or PostgreSQL on this machine. A
-metamorphic oracle was chosen for that reason and not as a concession to it,
-not a limitation of it.
+No other database. There is no DuckDB or PostgreSQL on this machine, and
+metamorphic oracles were chosen for that reason rather than in spite of
+it. The one second implementation here is Python's `fnmatch`, and it
+answers a question about the pattern language rather than about SQL: it
+cannot execute a query, so it says nothing about any relation above it.
 
 No floating point, no collation-dependent operators, no triggers,
 foreign keys, virtual tables or window functions. A view is in, but only
@@ -1077,8 +1080,8 @@ $ make test
 210 passed, 0 failed
 ```
 
-No pytest, no network, no dependencies. `sqlite3` is in the standard
-library, so that is the whole toolchain.
+No pytest, no network, no dependencies. `sqlite3` and `fnmatch` are in the
+standard library, so that is the whole toolchain.
 
 ## License
 
